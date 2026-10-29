@@ -3,16 +3,33 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 #include <unistd.h>
 
 int ios_system(const char *command);
 pid_t ios_fork(void);
-void ios_waitpid(pid_t pid);
 int ios_getCommandStatus(void);
+pthread_t ios_getThreadId(pid_t pid);
+void ios_releaseThreadId(pid_t pid);
+void ios_storeThreadId(pthread_t thread);
+pid_t ios_currentPid(void);
 void ios_setStreams(FILE *input, FILE *output, FILE *errors);
 extern __thread FILE *thread_stdin;
 extern __thread FILE *thread_stdout;
 extern __thread FILE *thread_stderr;
+
+/// ios_waitpid without spinning on a core: sleeps between checks. A pid still not started after 2 seconds belongs to a
+/// command that never will be. ios_fork holds ios_system's pid lock until a command stores its thread there, so this
+/// thread is stored in its place (which unlocks) before the pid ends.
+static void wait_for(pid_t pid) {
+    for (int unstarted = 0; ios_getThreadId(pid) != 0; usleep(1000)) {
+        if ((long)ios_getThreadId(pid) == -1 && ++unstarted > 2000) {
+            if (ios_currentPid() == pid) ios_storeThreadId(pthread_self());
+            ios_releaseThreadId(pid);
+            return;
+        }
+    }
+}
 
 static FILE *copy(FILE *stream, const char *mode) {
     fflush(stream);
@@ -40,7 +57,7 @@ int operator_run_shell(const char *command, FILE *input, FILE *output, FILE *err
     // ios_system can return while dash still runs: wait for it, then take its status (as ios_system does for &&).
     pid_t pid = ios_fork();
     ios_system(line);
-    ios_waitpid(pid);
+    wait_for(pid);
     int code = ios_getCommandStatus();
     ios_setStreams(savedIn, savedOut, savedErr);
     thread_stdin = savedIn;

@@ -63,6 +63,10 @@ for name, declarations in state.items():
 # No process-wide crash handler inside an app.
 edit("main.cc", "  sigaction(SIGSEGV, &new_action_, &orig_action_);\n", "")
 edit("main.cc", "  sigaction(SIGSEGV, &orig_action_, nullptr);\n", "")
+# The app's folder tells makefile from Makefile (upstream assumes Apple file systems do not).
+edit("main.cc", '    g_flags.makefile = "GNUmakefile";\n#if !defined(__APPLE__)\n  } else if (Exists("makefile")) {\n'
+     '    g_flags.makefile = "makefile";\n#endif\n',
+     '    g_flags.makefile = "GNUmakefile";\n  } else if (Exists("makefile")) {\n    g_flags.makefile = "makefile";\n')
 
 # Commands (recipes and $(shell)): one ios_system command in dash, its output collected in a temporary file.
 fileutil = src / "fileutil.cc"
