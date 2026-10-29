@@ -28,6 +28,8 @@ compile() { # source object [flags...]: one C file, with the command prefix
 
 framework() { # name entry version license objects...: links NAME.framework exporting only the entry point
     local name=$1 entry=$2 version=$3 license=$4; shift 4
+    # App Store Connect takes at most three period-separated integers (ITMS-90060).
+    echo "$version" | grep -Eq '^[0-9]+(\.[0-9]+){0,2}$' || { echo "error: $name version '$version' is not N[.N[.N]]"; exit 1; }
     local fw="$WORK/out/$PLATFORM/$name.framework"
     "$(xcrun -f clang)" -target "$TARGET" -isysroot "$SDK" -Os -fvisibility=hidden -ffile-prefix-map="$COMMAND"=. \
         -c "$COMMAND/command.c" -o "$WORK/command-$PLATFORM.o"
