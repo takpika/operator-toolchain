@@ -1,0 +1,4 @@
+_operator_clang_main
+_operator_wasm_ld_main
+_operator_ar_main
+_operator_nm_main
