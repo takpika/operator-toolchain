@@ -31,7 +31,7 @@ rm -rf "$FW"; mkdir -p "$FW"
     -Wl,-dead_strip -Wl,-exported_symbols_list,"$HERE/exports.txt" -F"$IOS_SYSTEM/$SLICE" -framework ios_system \
     -o "$FW/llvm" "$WORK/entry.o" "$DRIVER/driver.cpp.o" "$DRIVER/cc1_main.cpp.o" "$DRIVER/cc1as_main.cpp.o" \
     "$DRIVER/cc1gen_reproducer_main.cpp.o" "$BUILD/tools/llvm-ar/CMakeFiles/llvm-ar.dir/llvm-ar.cpp.o" \
-    "$BUILD/tools/llvm-nm/CMakeFiles/llvm-nm.dir/llvm-nm.cpp.o" $LIBS $LIBS
+    "$BUILD/tools/llvm-nm/CMakeFiles/llvm-nm.dir/llvm-nm.cpp.o" "$OUT/$PLATFORM/libcomponent-ld.a" $LIBS $LIBS
 xcrun strip -x "$FW/llvm"
 cat > "$FW/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

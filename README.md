@@ -6,9 +6,10 @@ repository. The app embeds the frameworks and runs them as commands inside itsel
 
 | Release asset | What it is |
 | --- | --- |
-| `llvm.xcframework.zip` | clang/clang++, wasm-ld, ar/ranlib and nm from LLVM, WebAssembly target only, in one framework |
+| `llvm.xcframework.zip` | clang/clang++, wasm-ld, ar/ranlib and nm from LLVM, WebAssembly target only, plus [wasm-component-ld](https://github.com/bytecodealliance/wasm-component-ld) (which turns linked programs into WASI 0.3 components), in one framework |
 | `git.xcframework.zip` | `git`: [libgit2](https://github.com/libgit2/libgit2) with [a-Shell](https://github.com/holzschu/a-shell)'s lg2 commands, HTTPS via Apple's Security framework |
-| `clang-data.lzma` | A tar (LZMA-compressed by Apple's Compression framework, as the app reads it) of what clang needs at run time, unpacked into the user's folder by the app's `clang-setup`: the [wasi-sdk](https://github.com/WebAssembly/wasi-sdk) wasm32-wasip1 sysroot (wasi-libc, libc++ with and without exceptions) and clang's own headers and builtins |
+| `clang-data.lzma` | A tar (LZMA-compressed by Apple's Compression framework, as the app reads it) of what clang needs at run time, unpacked into the user's folder by the app's `clang-setup`: the [wasi-sdk](https://github.com/WebAssembly/wasi-sdk) wasm32-wasip3 sysroot (wasi-libc, libc++ with and without exceptions) and clang's own headers and builtins |
+| `component-runtime.lzma` | A tar (compressed the same way) of what the app's web view needs to run WASI 0.2/0.3 components: [jco](https://github.com/bytecodealliance/jco)'s js-component-bindgen and its browser WASI 0.2 and 0.3 shims, with package imports rewritten to relative paths |
 
 ## Building
 
@@ -16,7 +17,7 @@ repository. The app embeds the frameworks and runs them as commands inside itsel
 ./build.sh
 ```
 
-Needs Xcode, cmake and ninja. It downloads pinned sources (checked by commit or SHA-256), builds for iOS devices and
+Needs Xcode, cmake, ninja and Rust (with the `aarch64-apple-ios` and `aarch64-apple-ios-sim` targets). It downloads pinned sources (checked by commit or SHA-256), builds for iOS devices and
 the simulator, and writes the assets and `SHA256SUMS` to `dist/`.
 
 ## What is changed
@@ -24,13 +25,15 @@ the simulator, and writes the assets and `SHA256SUMS` to `dist/`.
 - `llvm/patch.py` and `llvm/ios-prefix.h` let the tools run as threads of an app: `exit` and `abort` end only the
   command, output goes to the command's own streams, clang runs the linker in-process instead of starting a process,
   and LLVM installs no process-wide signal handlers and does not shut down its global state, so it can run again.
-- `llvm/entry.cpp` is what the app calls. It points clang at the sysroot in the user's folder, enables WASI's
+- `llvm/entry.cpp` is what the app calls. It makes clang build WASI 0.3 components (`wasm32-wasip3`), points it at the sysroot in the user's folder, enables WASI's
   emulated signal/mman/process-clocks/getpid, setjmp/longjmp, and C++ exceptions (standard WebAssembly exception
   instructions, as wasi-sdk's libraries use).
+- `component/patch.py` lets wasm-component-ld run in-process: it gets its arguments from the caller, runs the
+  framework's own wasm-ld instead of starting a process, and returns errors instead of exiting.
 - `git/patch.py` makes plain `git branch` list branches and removes a debug line from `git status`.
 
 ## Licenses
 
-Each framework carries its project's license: LLVM is Apache-2.0 with LLVM exceptions; libgit2 is GPL-2.0 with a
+Each framework carries its project's license: LLVM and wasm-component-ld are Apache-2.0 with LLVM exceptions; jco and its shims are Apache-2.0 with LLVM exceptions; libgit2 is GPL-2.0 with a
 linking exception; the lg2 commands are CC0; wasi-sdk's sysroot is Apache-2.0 with LLVM exceptions (wasi-libc also
 includes MIT-licensed musl). The scripts in this repository are MIT-licensed.

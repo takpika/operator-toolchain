@@ -1,5 +1,5 @@
 #!/bin/bash
-# The data clang needs, unpacked into the user's folder by clang-setup: the wasm32-wasip1 sysroot (wasi-libc,
+# The data clang needs, unpacked into the user's folder by clang-setup: the wasm32-wasip3 sysroot (wasi-libc,
 # libc++ with and without exceptions) and clang's own headers and builtins. Output: OUT/clang-data.tar
 # Usage: data.sh BUILD OUT
 set -euo pipefail
@@ -21,16 +21,16 @@ ROOT="$WORK/root"
 SYSROOT="$ROOT/wasi-sysroot"
 mkdir -p "$SYSROOT/include" "$SYSROOT/lib" "$SYSROOT/share"
 FROM="$WORK/download/wasi-sysroot-$WASI_SDK.0"
-cp -R "$FROM/include/wasm32-wasip1" "$SYSROOT/include/"
+cp -R "$FROM/include/wasm32-wasip3" "$SYSROOT/include/"
 # Empty, but clang reads the libc++ version (v1) from it before using the per-target headers.
 mkdir -p "$SYSROOT/include/c++/v1"
-cp -R "$FROM/lib/wasm32-wasip1" "$SYSROOT/lib/"
-cp -R "$FROM/share/wasm32-wasip1" "$SYSROOT/share/" 2>/dev/null || true
+cp -R "$FROM/lib/wasm32-wasip3" "$SYSROOT/lib/"
+cp -R "$FROM/share/wasm32-wasip3" "$SYSROOT/share/" 2>/dev/null || true
 # Static linking only; LTO libraries are only for -flto.
 find "$SYSROOT/lib" -name "*.so" -delete
-rm -rf "$SYSROOT/lib/wasm32-wasip1/llvm-lto" "$SYSROOT/lib/wasm32-wasip1"/*/llvm-lto
+rm -rf "$SYSROOT/lib/wasm32-wasip3/llvm-lto" "$SYSROOT/lib/wasm32-wasip3"/*/llvm-lto
 RESOURCE="$ROOT/lib/clang/$MAJOR"
-mkdir -p "$RESOURCE/lib/wasm32-unknown-wasip1"
+mkdir -p "$RESOURCE/lib/wasm32-unknown-wasip3"
 cp -R "$BUILD/lib/clang/$MAJOR/include" "$RESOURCE/"
 # Intrinsics and wrappers for other CPUs and GPUs.
 ( cd "$RESOURCE/include" && rm -rf cuda_wrappers openmp_wrappers ppc_wrappers llvm_libc_wrappers zos_wrappers \
@@ -39,8 +39,8 @@ cp -R "$BUILD/lib/clang/$MAJOR/include" "$RESOURCE/"
     larchintrin.h msa.h mmintrin.h xmmintrin.h emmintrin.h pmmintrin.h tmmintrin.h smmintrin.h nmmintrin.h \
     wmmintrin.h ammintrin.h mm3dnow.h mm_malloc.h cpuid.h gfni*.h sha*.h vaes*.h vpclmul*.h prfchw*.h \
     __wmmintrin_*.h 2>/dev/null || true )
-cp "$WORK/download/libclang_rt-$WASI_SDK.0/wasm32-unknown-wasip1/libclang_rt.builtins.a" \
-    "$RESOURCE/lib/wasm32-unknown-wasip1/"
+cp "$WORK/download/libclang_rt-$WASI_SDK.0/wasm32-unknown-wasip3/libclang_rt.builtins.a" \
+    "$RESOURCE/lib/wasm32-unknown-wasip3/"
 cp "$(dirname "$0")/data-id" "$ROOT/VERSION"
 COPYFILE_DISABLE=1 tar --no-mac-metadata --no-xattrs --uid 0 --gid 0 --uname root --gname wheel -cf "$OUT/clang-data.tar" -C "$ROOT" .
 du -sh "$ROOT" "$OUT/clang-data.tar"

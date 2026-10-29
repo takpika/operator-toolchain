@@ -23,6 +23,9 @@ int llvm_ar_main(int, char **, const llvm::ToolContext &);
 int llvm_nm_main(int, char **, const llvm::ToolContext &);
 LLD_HAS_DRIVER(wasm)
 
+/// wasm-component-ld (component/, Rust): links with wasm-ld, then turns the module into a component.
+extern "C" int operator_component_ld_main(int argc, const char **argv, int errors);
+
 namespace {
 
 pthread_mutex_t Lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
@@ -31,9 +34,17 @@ int linkWasm(llvm::ArrayRef<const char *> Args) {
   return lld::lldMain(Args, llvm::outs(), llvm::errs(), {{lld::Wasm, &lld::wasm::link}}).retCode;
 }
 
-/// Programs clang starts: the linker runs here instead of in a new process.
+/// Programs clang starts: the linkers run here instead of in a new process.
 int runChild(llvm::StringRef Program, llvm::ArrayRef<llvm::StringRef> Args, std::string *ErrMsg) {
   llvm::StringRef Name = llvm::sys::path::filename(Program);
+  if (Name == "wasm-component-ld") {
+    std::vector<std::string> Storage(Args.begin(), Args.end());
+    std::vector<const char *> Argv;
+    for (const std::string &Arg : Storage)
+      Argv.push_back(Arg.c_str());
+    llvm::errs().flush();
+    return operator_component_ld_main(int(Argv.size()), Argv.data(), llvm::standardFD(2));
+  }
   if (Name == "wasm-ld" || Name == "ld" || Name == "lld") {
     std::vector<std::string> Storage(Args.begin(), Args.end());
     Storage[0] = "wasm-ld";
@@ -83,6 +94,11 @@ bool hasOption(int Argc, char **Argv, const char *Name) {
 
 extern "C" {
 
+/// wasm-ld for wasm-component-ld, on the same thread.
+int operator_run_wasm_ld(int Argc, const char **Argv) {
+  return linkWasm(llvm::ArrayRef<const char *>(Argv, Argc));
+}
+
 /// The sysroot, clang's own headers and WASI's emulation libraries live in the user's folder, where clang-setup
 /// unpacks them (~/.local/share/operator/clang/<data id>); explicit options still win.
 __attribute__((visibility("default"))) int operator_clang_main(int Argc, char **Argv) {
@@ -93,6 +109,9 @@ __attribute__((visibility("default"))) int operator_clang_main(int Argc, char **
     return 78;
   }
   std::vector<std::string> Extra;
+  // Programs are WASI 0.3 components (the sysroot is wasm32-wasip3).
+  if (!hasOption(Argc, Argv, "--target") && !hasOption(Argc, Argv, "-target"))
+    Extra.push_back("--target=wasm32-wasip3");
   if (!hasOption(Argc, Argv, "--sysroot"))
     Extra.push_back("--sysroot=" + Root + "/wasi-sysroot");
   if (!hasOption(Argc, Argv, "-resource-dir"))
