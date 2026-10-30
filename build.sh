@@ -1,6 +1,6 @@
 #!/bin/bash
-# Builds the release assets into dist/: llvm.xcframework.zip, git.xcframework.zip, make.xcframework.zip, clang-data.lzma and
-# component-runtime.lzma, plus SHA256SUMS. Needs Xcode, cmake, ninja, git and Rust (rustup with the aarch64-apple-ios
+# Builds the release assets into dist/: llvm.xcframework.zip, git.xcframework.zip, make.xcframework.zip, sh.xcframework.zip,
+# clang-data.lzma and component-runtime.lzma, plus SHA256SUMS. Needs Xcode, cmake, ninja, git, Go 1.24+ and Rust (rustup with the aarch64-apple-ios
 # and aarch64-apple-ios-sim targets); takes about 20 minutes and 15GB on a recent Mac.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -37,11 +37,12 @@ for PLATFORM in iphoneos iphonesimulator; do
     "$HERE/llvm/framework.sh" "$SRC" "$BUILD" "$PLATFORM" "$IOS_SYSTEM_FW" "$WORK/out"
     "$HERE/git/build.sh" "$PLATFORM" "$IOS_SYSTEM_FW" "$WORK/out"
     "$HERE/kati/build.sh" "$PLATFORM" "$IOS_SYSTEM_FW" "$WORK"
+    "$HERE/shell/build.sh" "$PLATFORM" "$IOS_SYSTEM_FW" "$WORK"
 done
 "$HERE/llvm/data.sh" "$WORK/build-iphoneos" "$WORK/out"
 "$HERE/runtime/build.sh" "$WORK" "$DIST"
 
-for NAME in llvm git make; do
+for NAME in llvm git make sh; do
     rm -rf "$WORK/out/$NAME.xcframework"
     xcodebuild -create-xcframework -framework "$WORK/out/iphoneos/$NAME.framework" \
         -framework "$WORK/out/iphonesimulator/$NAME.framework" -output "$WORK/out/$NAME.xcframework" > /dev/null

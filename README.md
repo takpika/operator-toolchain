@@ -8,7 +8,8 @@ repository. The app embeds the frameworks and runs them as commands inside itsel
 | --- | --- |
 | `llvm.xcframework.zip` | clang/clang++, wasm-ld, ar/ranlib and nm from LLVM, WebAssembly target only, plus [wasm-component-ld](https://github.com/bytecodealliance/wasm-component-ld) (which turns linked programs into WASI 0.3 components), in one framework |
 | `git.xcframework.zip` | `git`: [libgit2](https://github.com/libgit2/libgit2) with [a-Shell](https://github.com/holzschu/a-shell)'s lg2 commands, HTTPS via Apple's Security framework |
-| `make.xcframework.zip` | `make`: [kati](https://github.com/google/kati), Google's GNU make clone (GNU Makefile syntax and functions); recipes and `$(shell)` run in the app's `sh` (dash) |
+| `make.xcframework.zip` | `make`: [kati](https://github.com/google/kati), Google's GNU make clone (GNU Makefile syntax and functions); recipes and `$(shell)` run in the app's `sh` |
+| `sh.xcframework.zip` | `operator-sh` (the app's `sh` and `bash`): [mvdan.cc/sh](https://github.com/mvdan/sh), a POSIX and bash interpreter written as a Go library. Its state is per interpreter, so any number run at once (dash needs a copy of its framework for each) |
 | `clang-data.lzma` | A tar (LZMA-compressed by Apple's Compression framework, as the app reads it) of what clang needs at run time, unpacked into the user's folder by the app's `clang-setup`: the [wasi-sdk](https://github.com/WebAssembly/wasi-sdk) wasm32-wasip3 sysroot (wasi-libc, libc++ with and without exceptions) and clang's own headers and builtins |
 | `component-runtime.lzma` | A tar (compressed the same way) of what the app's web view needs to run WASI 0.2/0.3 components: [jco](https://github.com/bytecodealliance/jco)'s js-component-bindgen and its browser WASI 0.2 and 0.3 shims, with package imports rewritten to relative paths |
 
@@ -18,7 +19,7 @@ repository. The app embeds the frameworks and runs them as commands inside itsel
 ./build.sh
 ```
 
-Needs Xcode, cmake, ninja and Rust (with the `aarch64-apple-ios` and `aarch64-apple-ios-sim` targets). It downloads pinned sources (checked by commit or SHA-256), builds for iOS devices and
+Needs Xcode, cmake, ninja, Go 1.24+ and Rust (with the `aarch64-apple-ios` and `aarch64-apple-ios-sim` targets). It downloads pinned sources (checked by commit or SHA-256), builds for iOS devices and
 the simulator, and writes the assets and `SHA256SUMS` to `dist/`.
 
 ## What is changed
@@ -42,5 +43,5 @@ the simulator, and writes the assets and `SHA256SUMS` to `dist/`.
 ## Licenses
 
 Each framework carries its project's license: LLVM and wasm-component-ld are Apache-2.0 with LLVM exceptions; jco and its shims are Apache-2.0 with LLVM exceptions; libgit2 is GPL-2.0 with a
-linking exception; the lg2 commands are CC0; kati is Apache-2.0; wasi-sdk's sysroot is Apache-2.0 with LLVM exceptions (wasi-libc also
+linking exception; the lg2 commands are CC0; kati is Apache-2.0; mvdan.cc/sh is BSD-3-Clause; wasi-sdk's sysroot is Apache-2.0 with LLVM exceptions (wasi-libc also
 includes MIT-licensed musl). The scripts in this repository are MIT-licensed.

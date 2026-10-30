@@ -1,6 +1,6 @@
 #!/bin/bash
 # make.framework: kati (Apache-2.0), Google's GNU make clone, as `make`: GNU make syntax and functions, recipes and
-# $(shell) run in dash. Usage: build.sh iphoneos|iphonesimulator IOS_SYSTEM_XCFRAMEWORK WORK
+# $(shell) run in sh (the app's shell). Usage: build.sh iphoneos|iphonesimulator IOS_SYSTEM_XCFRAMEWORK WORK
 set -euo pipefail
 PLATFORM=$1; IOS_SYSTEM=$2; WORK=$3
 HERE=$(cd "$(dirname "$0")" && pwd)

@@ -1,5 +1,5 @@
-// Shell commands for the tools (system, popen, kati's recipes): each runs in dash (`dash -c`, so ios_system resets
-// and reuses it) as an ios_system command of its own.
+// Shell commands for the tools (system, popen, kati's recipes): each runs in the app's shell (`sh -c`: sh is an alias
+// of its operator-sh, mvdan.cc/sh, of which any number run at once) as an ios_system command of its own.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,15 +37,15 @@ static FILE *copy(FILE *stream, const char *mode) {
     return descriptor < 0 ? NULL : fdopen(descriptor, mode);
 }
 
-/// Runs `command` in dash with these streams and returns its exit code. ios_system closes a shell's streams when it
-/// ends (end of input for a pipe), so dash gets copies; `errors` may be `output`.
+/// Runs `command` in the shell with these streams and returns its exit code, on copies of them; `errors` may be
+/// `output`.
 int operator_run_shell(const char *command, FILE *input, FILE *output, FILE *errors) {
     // ios_system takes the text between two record separators (0x1e) as one literal argument.
     if (strchr(command, '\x1e')) return 127;
-    size_t length = strlen(command) + sizeof("dash -c \x1e\x1e");
+    size_t length = strlen(command) + sizeof("sh -c \x1e\x1e");
     char *line = malloc(length);
     if (!line) return 127;
-    snprintf(line, length, "dash -c \x1e%s\x1e", command);
+    snprintf(line, length, "sh -c \x1e%s\x1e", command);
     FILE *in = copy(input, "r"), *out = copy(output, "w");
     FILE *err = errors == output ? out : copy(errors, "w");
     FILE *savedIn = thread_stdin, *savedOut = thread_stdout, *savedErr = thread_stderr;
@@ -54,7 +54,7 @@ int operator_run_shell(const char *command, FILE *input, FILE *output, FILE *err
     thread_stdin = in;
     thread_stdout = out;
     thread_stderr = err;
-    // ios_system can return while dash still runs: wait for it, then take its status (as ios_system does for &&).
+    // ios_system can return while the shell still runs: wait for it, then take its status (as ios_system does for &&).
     pid_t pid = ios_fork();
     ios_system(line);
     wait_for(pid);
