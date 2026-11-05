@@ -1,6 +1,6 @@
 #!/bin/bash
 # The data clang needs, unpacked into the user's folder by clang-setup: the wasm32-wasip3 sysroot (wasi-libc,
-# libc++ with and without exceptions) and clang's own headers and builtins. Output: OUT/clang-data.tar
+# libc++ with and without exceptions, static and shared) and clang's own headers and builtins. Output: OUT/clang-data.tar
 # Usage: data.sh BUILD OUT
 set -euo pipefail
 BUILD=$1; OUT=$2
@@ -26,8 +26,9 @@ cp -R "$FROM/include/wasm32-wasip3" "$SYSROOT/include/"
 mkdir -p "$SYSROOT/include/c++/v1"
 cp -R "$FROM/lib/wasm32-wasip3" "$SYSROOT/lib/"
 cp -R "$FROM/share/wasm32-wasip3" "$SYSROOT/share/" 2>/dev/null || true
-# Static linking only; LTO libraries are only for -flto.
-find "$SYSROOT/lib" -name "*.so" -delete
+# Shared libraries (wasi-libc, libc++ without exceptions) for programs that use dynamic linking, without their DWARF;
+# LTO libraries are only for -flto.
+find "$SYSROOT/lib" -name "*.so" -exec python3 -I "$(dirname "$0")/strip-debug.py" {} +
 rm -rf "$SYSROOT/lib/wasm32-wasip3/llvm-lto" "$SYSROOT/lib/wasm32-wasip3"/*/llvm-lto
 RESOURCE="$ROOT/lib/clang/$MAJOR"
 mkdir -p "$RESOURCE/lib/wasm32-unknown-wasip3"

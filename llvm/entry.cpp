@@ -90,6 +90,52 @@ bool hasOption(int Argc, char **Argv, const char *Name) {
   return false;
 }
 
+bool hasArgument(int Argc, char **Argv, const char *Name) {
+  for (int I = 1; I < Argc; ++I)
+    if (!strcmp(Argv[I], Name))
+      return true;
+  return false;
+}
+
+/// Whether this run links a program that uses shared libraries: a `.so` among the inputs, `-ldl`, `-rdynamic`, or
+/// a `-l` library that the `-L` folders have only as `lib<name>.so`. The sysroot's own libraries don't count, so
+/// ordinary programs stay static (one file, no linking when they start).
+bool linksDynamically(int Argc, char **Argv) {
+  std::vector<std::string> Folders;
+  for (int I = 1; I < Argc; ++I) {
+    llvm::StringRef Arg = Argv[I];
+    if (Arg == "-L" && I + 1 < Argc)
+      Folders.push_back(Argv[I + 1]);
+    else if (Arg.starts_with("-L"))
+      Folders.push_back(Arg.drop_front(2).str());
+  }
+  for (int I = 1; I < Argc; ++I) {
+    llvm::StringRef Arg = Argv[I];
+    if (I > 1 && (!strcmp(Argv[I - 1], "-o") || !strcmp(Argv[I - 1], "-L") || !strcmp(Argv[I - 1], "-I") ||
+                  !strcmp(Argv[I - 1], "-include") || !strcmp(Argv[I - 1], "-isystem")))
+      continue;
+    if (!Arg.starts_with("-") && (Arg.ends_with(".so") || Arg.contains(".so.")))
+      return true;
+    if (Arg == "-ldl" || Arg == "-rdynamic" || Arg == "-Wl,-Bdynamic")
+      return true;
+    std::string Library;
+    if (Arg == "-l" && I + 1 < Argc)
+      Library = Argv[I + 1];
+    else if (Arg.starts_with("-l"))
+      Library = Arg.drop_front(2).str();
+    if (Library.empty())
+      continue;
+    for (const std::string &Folder : Folders) {
+      std::string Base = Folder + "/lib" + Library;
+      if (access((Base + ".a").c_str(), F_OK) == 0)
+        break;
+      if (access((Base + ".so").c_str(), F_OK) == 0)
+        return true;
+    }
+  }
+  return false;
+}
+
 } // namespace
 
 extern "C" {
@@ -119,6 +165,23 @@ __attribute__((visibility("default"))) int operator_clang_main(int Argc, char **
   for (const char *Flag : {"-D_WASI_EMULATED_SIGNAL", "-D_WASI_EMULATED_MMAN", "-D_WASI_EMULATED_PROCESS_CLOCKS",
                            "-D_WASI_EMULATED_GETPID", "-Wno-unused-command-line-argument"})
     Extra.push_back(Flag);
+  // Code is position-independent and its symbols visible (as on Linux), so any object can go into a shared library
+  // (`-shared`, a `dylink.0` module) or a program that uses one.
+  if (!hasOption(Argc, Argv, "-fno-pic") && !hasOption(Argc, Argv, "-fno-PIC") && !hasOption(Argc, Argv, "-fno-pie") &&
+      !hasOption(Argc, Argv, "-fno-PIE"))
+    Extra.push_back("-fPIC");
+  if (!hasOption(Argc, Argv, "-fvisibility"))
+    Extra.push_back("-fvisibility=default");
+  // A program that uses shared libraries stays a core module with `dylink.0` (a position-independent executable):
+  // the app links it with the libraries it needs into a component when it starts, and dlopen can load more.
+  bool Links = !hasArgument(Argc, Argv, "-c") && !hasArgument(Argc, Argv, "-S") && !hasArgument(Argc, Argv, "-E") &&
+               !hasArgument(Argc, Argv, "-fsyntax-only") && !hasArgument(Argc, Argv, "-M") &&
+               !hasArgument(Argc, Argv, "-MM");
+  if (Links && !hasArgument(Argc, Argv, "-shared") && !hasArgument(Argc, Argv, "-static") &&
+      linksDynamically(Argc, Argv))
+    for (const char *Flag : {"-Wl,-pie", "-Wl,-Bdynamic", "-Wl,--import-memory", "-Wl,--export-dynamic",
+                             "-Wl,--skip-wit-component"})
+      Extra.push_back(Flag);
   // C++ code usually expects exceptions: WebAssembly exceptions (with libunwind) unless turned off.
   llvm::StringRef Name = llvm::sys::path::filename(Argv[0]);
   bool CXX = Name.ends_with("++");

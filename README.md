@@ -6,11 +6,11 @@ repository. The app embeds the frameworks and runs them as commands inside itsel
 
 | Release asset | What it is |
 | --- | --- |
-| `llvm.xcframework.zip` | clang/clang++, wasm-ld, ar/ranlib and nm from LLVM, WebAssembly target only, plus [wasm-component-ld](https://github.com/bytecodealliance/wasm-component-ld) (which turns linked programs into WASI 0.3 components), in one framework |
+| `llvm.xcframework.zip` | clang/clang++, wasm-ld, ar/ranlib and nm from LLVM, WebAssembly target only, plus [wasm-component-ld](https://github.com/bytecodealliance/wasm-component-ld) (which turns linked programs into WASI 0.3 components) and [wit-component](https://github.com/bytecodealliance/wasm-tools/tree/main/crates/wit-component)'s linker (which the app uses to link a program with its shared libraries into a component when it starts), in one framework |
 | `git.xcframework.zip` | `git`: [libgit2](https://github.com/libgit2/libgit2) with [a-Shell](https://github.com/holzschu/a-shell)'s lg2 commands, HTTPS via Apple's Security framework |
 | `make.xcframework.zip` | `make`: [kati](https://github.com/google/kati), Google's GNU make clone (GNU Makefile syntax and functions); recipes and `$(shell)` run in the app's `sh` |
 | `sh.xcframework.zip` | `operator-sh` (the app's `sh` and `bash`): [mvdan.cc/sh](https://github.com/mvdan/sh), a POSIX and bash interpreter written as a Go library. Its state is per interpreter, so any number run at once (dash needs a copy of its framework for each) |
-| `clang-data.lzma` | A tar (LZMA-compressed by Apple's Compression framework, as the app reads it) of what clang needs at run time, unpacked into the user's folder by the app's `clang-setup`: the [wasi-sdk](https://github.com/WebAssembly/wasi-sdk) wasm32-wasip3 sysroot (wasi-libc, libc++ with and without exceptions) and clang's own headers and builtins |
+| `clang-data.lzma` | A tar (LZMA-compressed by Apple's Compression framework, as the app reads it) of what clang needs at run time, unpacked into the user's folder by the app's `clang-setup`: the [wasi-sdk](https://github.com/WebAssembly/wasi-sdk) wasm32-wasip3 sysroot (wasi-libc, libc++ with and without exceptions; static, and shared without DWARF) and clang's own headers and builtins |
 | `component-runtime.lzma` | A tar (compressed the same way) of what the app's web view needs to run WASI 0.2/0.3 components: [jco](https://github.com/bytecodealliance/jco)'s js-component-bindgen and its browser WASI 0.2 and 0.3 shims, with package imports rewritten to relative paths |
 
 ## Building
@@ -29,7 +29,12 @@ the simulator, and writes the assets and `SHA256SUMS` to `dist/`.
   and LLVM installs no process-wide signal handlers and does not shut down its global state, so it can run again.
 - `llvm/entry.cpp` is what the app calls. It makes clang build WASI 0.3 components (`wasm32-wasip3`), points it at the sysroot in the user's folder, enables WASI's
   emulated signal/mman/process-clocks/getpid, setjmp/longjmp, and C++ exceptions (standard WebAssembly exception
-  instructions, as wasi-sdk's libraries use).
+  instructions, as wasi-sdk's libraries use). Code is position-independent with visible symbols by default, so any
+  object can go into a shared library (`-shared`). A program linked against a shared library of its own (a `.so`
+  input, `-l` found only as `.so`, `-ldl` or `-rdynamic`) is left as a position-independent core module with
+  `dylink.0` instead of a component; the app links it with its libraries when it starts.
+- `component/src/lib.rs` also exports `operator_component_link`, wit-component's shared-everything `Linker` (with its
+  built-in libdl, since the sysroot's `libdl.so` is a stub), which the app calls to do that.
 - `component/patch.py` lets wasm-component-ld run in-process: it gets its arguments from the caller, runs the
   framework's own wasm-ld instead of starting a process, and returns errors instead of exiting.
 - `git/patch.py` makes plain `git branch` list branches and removes a debug line from `git status`; `git/entry.c`
