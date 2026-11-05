@@ -136,6 +136,49 @@ bool linksDynamically(int Argc, char **Argv) {
   return false;
 }
 
+/// main's return value as the program's exit code. WASI 0.3's `run` reports only success or failure, so crt1 turns
+/// `return 3` into 1; with `--wrap=__main_void` (crt1 calls main through it) this passes a non-zero result to exit(),
+/// which keeps it (exit-with-code), after the same cleanup; as on Linux, only its low 8 bits. An archive, so a program without crt1's call (a reactor,
+/// -nostartfiles) never pulls it in.
+const char ExitCodeSource[] = "#include <stdlib.h>\n"
+                              "int __real___main_void(void);\n"
+                              "int __wrap___main_void(void) {\n"
+                              "  int status = __real___main_void();\n"
+                              "  if (status != 0)\n"
+                              "    exit(status & 0xff);\n"
+                              "  return 0;\n"
+                              "}\n";
+
+/// The archive with the wrapper above, built by this clang into the user's data folder the first time it is needed.
+bool exitCodeLibrary(const std::string &Root, char *Clang, std::string &Library) {
+  Library = Root + "/lib/operator-exit-code-1.a";
+  if (access(Library.c_str(), F_OK) == 0)
+    return true;
+  std::string Base = Root + "/lib/.operator-exit-code-" + std::to_string(getpid());
+  std::string Source = Base + ".c", Object = Base + ".o", Archive = Base + ".a";
+  FILE *File = fopen(Source.c_str(), "w");
+  if (!File)
+    return false;
+  fputs(ExitCodeSource, File);
+  fclose(File);
+  std::string Sysroot = "--sysroot=" + Root + "/wasi-sysroot";
+  std::string Resources = "-resource-dir=" + Root + "/lib/clang/" CLANG_MAJOR;
+  std::vector<const char *> Compile{Clang, "--target=wasm32-wasip3", Sysroot.c_str(), Resources.c_str(), "-O2",
+                                    "-fPIC", "-fvisibility=default", "-x", "c", "-c", Source.c_str(), "-o",
+                                    Object.c_str(), nullptr};
+  bool Built = clang_main(int(Compile.size() - 1), const_cast<char **>(Compile.data()), {Clang, nullptr, false}) == 0;
+  if (Built) {
+    std::vector<const char *> Ar{"llvm-ar", "rcs", Archive.c_str(), Object.c_str(), nullptr};
+    Built = llvm_ar_main(int(Ar.size() - 1), const_cast<char **>(Ar.data()), {"llvm-ar", nullptr, false}) == 0;
+  }
+  if (Built)
+    Built = rename(Archive.c_str(), Library.c_str()) == 0;
+  unlink(Source.c_str());
+  unlink(Object.c_str());
+  unlink(Archive.c_str());
+  return Built;
+}
+
 } // namespace
 
 extern "C" {
@@ -201,15 +244,23 @@ __attribute__((visibility("default"))) int operator_clang_main(int Argc, char **
   Libraries.push_back("-lsetjmp");
   if (Exceptions)
     Libraries.push_back("-lunwind");
-  std::vector<char *> Args{Argv[0]};
-  for (std::string &Arg : Extra)
-    Args.push_back(Arg.data());
-  for (int I = 1; I < Argc; ++I)
-    Args.push_back(Argv[I]);
-  for (std::string &Library : Libraries)
-    Args.push_back(Library.data());
-  Args.push_back(nullptr);
+  bool WrapsMain = Links && !hasArgument(Argc, Argv, "-shared") && !hasArgument(Argc, Argv, "-r") &&
+                   !hasArgument(Argc, Argv, "-nostartfiles") && !hasArgument(Argc, Argv, "-nostdlib") &&
+                   !hasOption(Argc, Argv, "-mexec-model=reactor") && !hasArgument(Argc, Argv, "-Wl,--no-entry");
   return run([&] {
+    std::string ExitCode;
+    if (WrapsMain && exitCodeLibrary(Root, Argv[0], ExitCode)) {
+      Extra.push_back("-Wl,--wrap=__main_void");
+      Libraries.push_back(ExitCode);
+    }
+    std::vector<char *> Args{Argv[0]};
+    for (std::string &Arg : Extra)
+      Args.push_back(Arg.data());
+    for (int I = 1; I < Argc; ++I)
+      Args.push_back(Argv[I]);
+    for (std::string &Library : Libraries)
+      Args.push_back(Library.data());
+    Args.push_back(nullptr);
     return clang_main(int(Args.size() - 1), Args.data(), {Args[0], nullptr, false});
   });
 }

@@ -33,6 +33,9 @@ the simulator, and writes the assets and `SHA256SUMS` to `dist/`.
   object can go into a shared library (`-shared`). A program linked against a shared library of its own (a `.so`
   input, `-l` found only as `.so`, `-ldl` or `-rdynamic`) is left as a position-independent core module with
   `dylink.0` instead of a component; the app links it with its libraries when it starts.
+  It also makes main's return value the exit code: WASI 0.3's `run` reports only success or failure, so programs are
+  linked with `--wrap=__main_void` and a small wrapper (built by clang into the user's data folder the first time)
+  that passes a non-zero result to `exit()`.
 - `component/src/lib.rs` also exports `operator_component_link`, wit-component's shared-everything `Linker` (with its
   built-in libdl, since the sysroot's `libdl.so` is a stub), which the app calls to do that.
 - `component/patch.py` lets wasm-component-ld run in-process: it gets its arguments from the caller, runs the
