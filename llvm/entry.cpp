@@ -136,49 +136,6 @@ bool linksDynamically(int Argc, char **Argv) {
   return false;
 }
 
-/// main's return value as the program's exit code. WASI 0.3's `run` reports only success or failure, so crt1 turns
-/// `return 3` into 1; with `--wrap=__main_void` (crt1 calls main through it) this passes a non-zero result to exit(),
-/// which keeps it (exit-with-code), after the same cleanup; as on Linux, only its low 8 bits. An archive, so a program without crt1's call (a reactor,
-/// -nostartfiles) never pulls it in.
-const char ExitCodeSource[] = "#include <stdlib.h>\n"
-                              "int __real___main_void(void);\n"
-                              "int __wrap___main_void(void) {\n"
-                              "  int status = __real___main_void();\n"
-                              "  if (status != 0)\n"
-                              "    exit(status & 0xff);\n"
-                              "  return 0;\n"
-                              "}\n";
-
-/// The archive with the wrapper above, built by this clang into the user's data folder the first time it is needed.
-bool exitCodeLibrary(const std::string &Root, char *Clang, std::string &Library) {
-  Library = Root + "/lib/operator-exit-code-1.a";
-  if (access(Library.c_str(), F_OK) == 0)
-    return true;
-  std::string Base = Root + "/lib/.operator-exit-code-" + std::to_string(getpid());
-  std::string Source = Base + ".c", Object = Base + ".o", Archive = Base + ".a";
-  FILE *File = fopen(Source.c_str(), "w");
-  if (!File)
-    return false;
-  fputs(ExitCodeSource, File);
-  fclose(File);
-  std::string Sysroot = "--sysroot=" + Root + "/wasi-sysroot";
-  std::string Resources = "-resource-dir=" + Root + "/lib/clang/" CLANG_MAJOR;
-  std::vector<const char *> Compile{Clang, "--target=wasm32-wasip3", Sysroot.c_str(), Resources.c_str(), "-O2",
-                                    "-fPIC", "-fvisibility=default", "-x", "c", "-c", Source.c_str(), "-o",
-                                    Object.c_str(), nullptr};
-  bool Built = clang_main(int(Compile.size() - 1), const_cast<char **>(Compile.data()), {Clang, nullptr, false}) == 0;
-  if (Built) {
-    std::vector<const char *> Ar{"llvm-ar", "rcs", Archive.c_str(), Object.c_str(), nullptr};
-    Built = llvm_ar_main(int(Ar.size() - 1), const_cast<char **>(Ar.data()), {"llvm-ar", nullptr, false}) == 0;
-  }
-  if (Built)
-    Built = rename(Archive.c_str(), Library.c_str()) == 0;
-  unlink(Source.c_str());
-  unlink(Object.c_str());
-  unlink(Archive.c_str());
-  return Built;
-}
-
 } // namespace
 
 extern "C" {
@@ -206,7 +163,7 @@ __attribute__((visibility("default"))) int operator_clang_main(int Argc, char **
   if (!hasOption(Argc, Argv, "-resource-dir"))
     Extra.push_back("-resource-dir=" + Root + "/lib/clang/" CLANG_MAJOR);
   for (const char *Flag : {"-D_WASI_EMULATED_SIGNAL", "-D_WASI_EMULATED_MMAN", "-D_WASI_EMULATED_PROCESS_CLOCKS",
-                           "-D_WASI_EMULATED_GETPID", "-Wno-unused-command-line-argument"})
+                           "-Wno-unused-command-line-argument"})
     Extra.push_back(Flag);
   // Code is position-independent and its symbols visible (as on Linux), so any object can go into a shared library
   // (`-shared`, a `dylink.0` module) or a program that uses one.
@@ -215,16 +172,6 @@ __attribute__((visibility("default"))) int operator_clang_main(int Argc, char **
     Extra.push_back("-fPIC");
   if (!hasOption(Argc, Argv, "-fvisibility"))
     Extra.push_back("-fvisibility=default");
-  // A program that uses shared libraries stays a core module with `dylink.0` (a position-independent executable):
-  // the app links it with the libraries it needs into a component when it starts, and dlopen can load more.
-  bool Links = !hasArgument(Argc, Argv, "-c") && !hasArgument(Argc, Argv, "-S") && !hasArgument(Argc, Argv, "-E") &&
-               !hasArgument(Argc, Argv, "-fsyntax-only") && !hasArgument(Argc, Argv, "-M") &&
-               !hasArgument(Argc, Argv, "-MM");
-  if (Links && !hasArgument(Argc, Argv, "-shared") && !hasArgument(Argc, Argv, "-static") &&
-      linksDynamically(Argc, Argv))
-    for (const char *Flag : {"-Wl,-pie", "-Wl,-Bdynamic", "-Wl,--import-memory", "-Wl,--export-dynamic",
-                             "-Wl,--skip-wit-component"})
-      Extra.push_back(Flag);
   // C++ code usually expects exceptions: WebAssembly exceptions (with libunwind) unless turned off.
   llvm::StringRef Name = llvm::sys::path::filename(Argv[0]);
   bool CXX = Name.ends_with("++");
@@ -233,26 +180,32 @@ __attribute__((visibility("default"))) int operator_clang_main(int Argc, char **
   if (CXX && !NoExceptions && !hasOption(Argc, Argv, "-fwasm-exceptions"))
     Extra.push_back("-fwasm-exceptions");
   bool Exceptions = !NoExceptions && (CXX || hasOption(Argc, Argv, "-fwasm-exceptions"));
+  // A program uses libc as a shared library, as elsewhere: it stays a core module with `dylink.0` (a position-independent
+  // executable), which the app links with the libraries it needs when it starts, so it gets the system's libc, and dlopen
+  // can load more. `-static` builds libc into the program. The sysroot's shared libc++ has no exceptions, so a program
+  // that uses them links statically unless it names a shared library.
+  bool Links = !hasArgument(Argc, Argv, "-c") && !hasArgument(Argc, Argv, "-S") && !hasArgument(Argc, Argv, "-E") &&
+               !hasArgument(Argc, Argv, "-fsyntax-only") && !hasArgument(Argc, Argv, "-M") &&
+               !hasArgument(Argc, Argv, "-MM");
+  bool Program = Links && !hasArgument(Argc, Argv, "-shared") && !hasArgument(Argc, Argv, "-r") &&
+                 !hasArgument(Argc, Argv, "-static") && !hasArgument(Argc, Argv, "-nostartfiles") &&
+                 !hasArgument(Argc, Argv, "-nostdlib") && !hasOption(Argc, Argv, "-mexec-model=reactor") &&
+                 !hasArgument(Argc, Argv, "-Wl,--no-entry");
+  if (Program && (!Exceptions || linksDynamically(Argc, Argv)))
+    for (const char *Flag : {"-Wl,-pie", "-Wl,-Bdynamic", "-Wl,--import-memory", "-Wl,--export-dynamic",
+                             "-Wl,--skip-wit-component"})
+      Extra.push_back(Flag);
   // wasi-sdk's libraries use the standard (exnref) exception instructions; one module cannot mix them with the
   // legacy ones clang emits by default. setjmp/longjmp use the same mechanism.
   for (const char *Flag : {"-mllvm", "-wasm-use-legacy-eh=false", "-mllvm", "-wasm-enable-sjlj"})
     Extra.push_back(Flag);
   std::vector<std::string> Libraries;
-  for (const char *Library : {"-lwasi-emulated-signal", "-lwasi-emulated-mman", "-lwasi-emulated-process-clocks",
-                              "-lwasi-emulated-getpid"})
+  for (const char *Library : {"-lwasi-emulated-signal", "-lwasi-emulated-mman", "-lwasi-emulated-process-clocks"})
     Libraries.push_back(Library);
   Libraries.push_back("-lsetjmp");
   if (Exceptions)
     Libraries.push_back("-lunwind");
-  bool WrapsMain = Links && !hasArgument(Argc, Argv, "-shared") && !hasArgument(Argc, Argv, "-r") &&
-                   !hasArgument(Argc, Argv, "-nostartfiles") && !hasArgument(Argc, Argv, "-nostdlib") &&
-                   !hasOption(Argc, Argv, "-mexec-model=reactor") && !hasArgument(Argc, Argv, "-Wl,--no-entry");
   return run([&] {
-    std::string ExitCode;
-    if (WrapsMain && exitCodeLibrary(Root, Argv[0], ExitCode)) {
-      Extra.push_back("-Wl,--wrap=__main_void");
-      Libraries.push_back(ExitCode);
-    }
     std::vector<char *> Args{Argv[0]};
     for (std::string &Arg : Extra)
       Args.push_back(Arg.data());

@@ -26,6 +26,8 @@ cp -R "$FROM/include/wasm32-wasip3" "$SYSROOT/include/"
 mkdir -p "$SYSROOT/include/c++/v1"
 cp -R "$FROM/lib/wasm32-wasip3" "$SYSROOT/lib/"
 cp -R "$FROM/share/wasm32-wasip3" "$SYSROOT/share/" 2>/dev/null || true
+# wasi-libc is this project's own build: see libc/build.sh.
+"$(dirname "$0")/libc/build.sh" "$SYSROOT" "$WORK/download/libclang_rt-$WASI_SDK.0/wasm32-unknown-wasip3/libclang_rt.builtins.a" "$WORK"
 # Shared libraries (wasi-libc, libc++ without exceptions) for programs that use dynamic linking, without their DWARF;
 # LTO libraries are only for -flto.
 find "$SYSROOT/lib" -name "*.so" -exec python3 -I "$(dirname "$0")/strip-debug.py" {} +

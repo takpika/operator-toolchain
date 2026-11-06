@@ -1,0 +1,2383 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index e3dcfd9..b44a4d7 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -371,7 +371,7 @@ endif()
+ if (WASI STREQUAL "p2")
+   set(libc_extra_objects libc-bottom-half/sources/wasip2_component_type.o)
+ elseif (WASI STREQUAL "p3")
+-  set(libc_extra_objects libc-bottom-half/sources/wasip3_component_type.o)
++  set(libc_extra_objects libc-bottom-half/sources/wasip3_component_type.o libc-bottom-half/sources/operator_system_component_type.o)
+ endif()
+ 
+ add_library(c SHARED EXCLUDE_FROM_ALL
+diff --git a/libc-bottom-half/CMakeLists.txt b/libc-bottom-half/CMakeLists.txt
+index 118a6b2..ec4abf0 100644
+--- a/libc-bottom-half/CMakeLists.txt
++++ b/libc-bottom-half/CMakeLists.txt
+@@ -119,6 +119,7 @@ set(bottom_half_sources
+   sources/abort.c
+   sources/at_fdcwd.c
+   sources/chdir.c
++  sources/operator_system.c
+   sources/complex-builtins.c
+   sources/dup.c
+   sources/environ.c
+@@ -159,7 +160,6 @@ else()
+     sources/recv.c
+     sources/send.c
+     sources/shutdown.c
+-    sources/socket.c
+     sources/sockets_utils.c
+     sources/sockopt.c
+     sources/tcp.c
+diff --git a/libc-bottom-half/cloudlibc/src/libc/fcntl/fcntl.c b/libc-bottom-half/cloudlibc/src/libc/fcntl/fcntl.c
+index 3c44db8..beecddd 100644
+--- a/libc-bottom-half/cloudlibc/src/libc/fcntl/fcntl.c
++++ b/libc-bottom-half/cloudlibc/src/libc/fcntl/fcntl.c
+@@ -101,10 +101,14 @@ int fcntl(int fildes, int cmd, ...) {
+ #endif
+     case F_GETLK:
+     case F_SETLK:
+-    case F_SETLKW:
+-      // POSIX advisory record locking is not supported by WASI.
+-      errno = ENOTSUP;
+-      return -1;
++    case F_SETLKW: {
++      va_list ap;
++      va_start(ap, cmd);
++      struct flock *lock = va_arg(ap, struct flock *);
++      va_end(ap);
++      extern int __operator_record_lock(int, int, struct flock *);
++      return __operator_record_lock(fildes, cmd, lock);
++    }
+     default:
+       errno = EINVAL;
+       return -1;
+diff --git a/libc-bottom-half/cloudlibc/src/libc/sys/stat/stat_impl.h b/libc-bottom-half/cloudlibc/src/libc/sys/stat/stat_impl.h
+index c55075f..4a2dcb6 100644
+--- a/libc-bottom-half/cloudlibc/src/libc/sys/stat/stat_impl.h
++++ b/libc-bottom-half/cloudlibc/src/libc/sys/stat/stat_impl.h
+@@ -123,7 +123,12 @@ static inline void to_public_stat(const filesystem_metadata_hash_value_t *metada
+     case FILESYSTEM_DESCRIPTOR_TYPE_SYMBOLIC_LINK:
+       out->st_mode |= S_IFLNK;
+       break;
++    case FILESYSTEM_DESCRIPTOR_TYPE_FIFO:
++      out->st_mode |= S_IFIFO;
++      break;
+   }
++  // WASI has no permissions; `stat` and `lstat` ask the kernel, and these stand in where there's only a descriptor.
++  out->st_mode |= S_ISDIR(out->st_mode) ? 0755 : 0644;
+   filesystem_descriptor_stat_free(in);
+ }
+ #else
+diff --git a/libc-bottom-half/cloudlibc/src/libc/unistd/read.c b/libc-bottom-half/cloudlibc/src/libc/unistd/read.c
+index 5ce69fe..9d279b3 100644
+--- a/libc-bottom-half/cloudlibc/src/libc/unistd/read.c
++++ b/libc-bottom-half/cloudlibc/src/libc/unistd/read.c
+@@ -26,6 +26,10 @@ ssize_t read(int fildes, void *buf, size_t nbyte) {
+   }
+   return bytes_read;
+ #else
++  extern ssize_t __operator_socket_read(int, void *, size_t);
++  ssize_t from_socket = __operator_socket_read(fildes, buf, nbyte);
++  if (from_socket != -2)
++    return from_socket;
+   descriptor_table_entry_t entry;
+   if (descriptor_table_get(fildes, &entry) < 0)
+     return -1;
+diff --git a/libc-bottom-half/cloudlibc/src/libc/unistd/write.c b/libc-bottom-half/cloudlibc/src/libc/unistd/write.c
+index 0b9dc4f..30bb825 100644
+--- a/libc-bottom-half/cloudlibc/src/libc/unistd/write.c
++++ b/libc-bottom-half/cloudlibc/src/libc/unistd/write.c
+@@ -27,6 +27,10 @@ ssize_t write(int fildes, const void *buf, size_t nbyte) {
+   }
+   return bytes_written;
+ #else
++  extern ssize_t __operator_socket_write(int, const void *, size_t);
++  ssize_t from_socket = __operator_socket_write(fildes, buf, nbyte);
++  if (from_socket != -2)
++    return from_socket;
+   descriptor_table_entry_t entry;
+   if (descriptor_table_get(fildes, &entry) < 0)
+     return -1;
+diff --git a/libc-bottom-half/crt/crt1-command.c b/libc-bottom-half/crt/crt1-command.c
+index f047082..3aee749 100644
+--- a/libc-bottom-half/crt/crt1-command.c
++++ b/libc-bottom-half/crt/crt1-command.c
+@@ -65,7 +65,12 @@ __attribute__((export_name("wasi:cli/run@0.3.0#run"))) int _start(void)
+   }
+ #elif defined(__wasip2__) || defined(__wasip3__)
+   __wasilibc_assert_no_descriptor_leaks();
+-  return r != 0;
++  // `run` reports only success or failure: main's value goes to the host as the exit code, as on any other system.
++  if (r != 0) {
++    extern _Noreturn void _Exit(int);
++    _Exit(r & 0xff);
++  }
++  return 0;
+ #else
+ #error "Unsupported WASI version"
+ #endif
+diff --git a/libc-bottom-half/getpid/getpid.c b/libc-bottom-half/getpid/getpid.c
+index b09797a..b44d0fe 100644
+--- a/libc-bottom-half/getpid/getpid.c
++++ b/libc-bottom-half/getpid/getpid.c
+@@ -1,6 +1 @@
+-#include <unistd.h>
+-
+-pid_t getpid(void) {
+-  // Return an arbitrary value, greater than 1 which is special.
+-  return 42;
+-}
++// getpid is the kernel's now (sources/operator_system.c); this library stays for programs that ask for it by name.
+diff --git a/libc-bottom-half/headers/public/__typedef_sigset_t.h b/libc-bottom-half/headers/public/__typedef_sigset_t.h
+index f7e4867..1524d7a 100644
+--- a/libc-bottom-half/headers/public/__typedef_sigset_t.h
++++ b/libc-bottom-half/headers/public/__typedef_sigset_t.h
+@@ -2,6 +2,6 @@
+ #define __wasilibc___typedef_sigset_t_h
+ 
+ /* TODO: This is just a placeholder for now. Keep this in sync with musl. */
+-typedef unsigned char sigset_t;
++typedef struct __sigset_t { unsigned long __bits[128 / sizeof(long)]; } sigset_t;
+ 
+ #endif
+diff --git a/libc-bottom-half/headers/public/wasi/libc-find-relpath.h b/libc-bottom-half/headers/public/wasi/libc-find-relpath.h
+index b519d4e..e6c52e8 100644
+--- a/libc-bottom-half/headers/public/wasi/libc-find-relpath.h
++++ b/libc-bottom-half/headers/public/wasi/libc-find-relpath.h
+@@ -66,7 +66,7 @@ int __wasilibc_find_abspath(const char *abspath,
+  */
+ int __wasilibc_find_relpath_alloc(const char *path, const char **abs,
+                                   char **relative, size_t *relative_len,
+-                                  int can_realloc) __attribute__((__weak__));
++                                  int can_realloc);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/libc-bottom-half/mman/mman.c b/libc-bottom-half/mman/mman.c
+index 75cb868..0f58ad8 100644
+--- a/libc-bottom-half/mman/mman.c
++++ b/libc-bottom-half/mman/mman.c
+@@ -18,8 +18,33 @@ struct map {
+   int flags;
+   off_t offset;
+   size_t length;
++  int fd;
+ };
+ 
++// A shared mapping goes back to its file when asked and when it's unmapped.
++static int write_back(struct map *map) {
++  if (!(map->flags & MAP_SHARED) || !(map->prot & PROT_WRITE) || map->fd < 0)
++    return 0;
++  const char *body = (const char *)(map + 1);
++  size_t left = map->length;
++  off_t offset = map->offset;
++  while (left > 0) {
++    ssize_t written = pwrite(map->fd, body, left, offset);
++    if (written < 0)
++      return -1;
++    left -= (size_t)written;
++    offset += written;
++    body += written;
++  }
++  return 0;
++}
++
++int msync(void *addr, size_t length, int flags) {
++  (void)length;
++  (void)flags;
++  return write_back((struct map *)addr - 1);
++}
++
+ void *mmap(void *addr, size_t length, int prot, int flags, int fd,
+            off_t offset) {
+   // Check for unsupported flags.
+@@ -79,6 +104,7 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd,
+   map->flags = flags;
+   map->offset = offset;
+   map->length = length;
++  map->fd = (flags & MAP_SHARED) && (prot & PROT_WRITE) && !(flags & MAP_ANON) ? dup(fd) : -1;
+ 
+   // Initialize the main memory buffer, either with the contents of a file,
+   // or with zeros.
+@@ -119,7 +145,12 @@ int munmap(void *addr, size_t length) {
+   }
+ 
+   // Release the memory.
++  int written = write_back(map);
++  if (map->fd >= 0)
++    close(map->fd);
+   free(map);
++  if (written < 0)
++    return -1;
+ 
+   // Success!
+   return 0;
+diff --git a/libc-bottom-half/signal/signal.c b/libc-bottom-half/signal/signal.c
+index ff946aa..23c6781 100644
+--- a/libc-bottom-half/signal/signal.c
++++ b/libc-bottom-half/signal/signal.c
+@@ -139,3 +139,62 @@ void (*signal(int sig, void (*func)(int)))(int) {
+ 
+ extern __typeof(signal) bsd_signal __attribute__((weak, alias("signal")));
+ extern __typeof(signal) __sysv_signal __attribute__((weak, alias("signal")));
++
++// The rest of the signal calls, over the above: a handler runs when the program raises the signal itself.
++#include <string.h>
++#include <unistd.h>
++
++static sigset_t blocked;
++
++int sigemptyset(sigset_t *set) { memset(set, 0, sizeof *set); return 0; }
++int sigfillset(sigset_t *set) { memset(set, 0xff, sizeof *set); return 0; }
++static int bit(int sig, size_t *word, unsigned long *mask) {
++  if (sig < 1 || sig > 64) { errno = EINVAL; return -1; }
++  *word = (size_t)(sig - 1) / (8 * sizeof(unsigned long));
++  *mask = 1UL << ((sig - 1) % (8 * sizeof(unsigned long)));
++  return 0;
++}
++int sigaddset(sigset_t *set, int sig) {
++  size_t word; unsigned long mask;
++  if (bit(sig, &word, &mask)) return -1;
++  set->__bits[word] |= mask;
++  return 0;
++}
++int sigdelset(sigset_t *set, int sig) {
++  size_t word; unsigned long mask;
++  if (bit(sig, &word, &mask)) return -1;
++  set->__bits[word] &= ~mask;
++  return 0;
++}
++int sigismember(const sigset_t *set, int sig) {
++  size_t word; unsigned long mask;
++  if (bit(sig, &word, &mask)) return -1;
++  return (set->__bits[word] & mask) != 0;
++}
++int sigprocmask(int how, const sigset_t *restrict set, sigset_t *restrict old) {
++  if (old) *old = blocked;
++  if (!set) return 0;
++  for (size_t i = 0; i < sizeof(blocked.__bits) / sizeof(*blocked.__bits); i++) {
++    if (how == SIG_BLOCK) blocked.__bits[i] |= set->__bits[i];
++    else if (how == SIG_UNBLOCK) blocked.__bits[i] &= ~set->__bits[i];
++    else if (how == SIG_SETMASK) blocked.__bits[i] = set->__bits[i];
++    else { errno = EINVAL; return -1; }
++  }
++  return 0;
++}
++int pthread_sigmask(int how, const sigset_t *restrict set, sigset_t *restrict old) {
++  return sigprocmask(how, set, old) ? errno : 0;
++}
++int sigpending(sigset_t *set) { return sigemptyset(set); }
++int sigaction(int sig, const struct sigaction *restrict action, struct sigaction *restrict old) {
++  void (*previous)(int) = SIG_DFL;
++  if (action) previous = signal(sig, action->sa_handler);
++  else { previous = signal(sig, SIG_DFL); signal(sig, previous); }
++  if (previous == SIG_ERR) return -1;
++  if (old) { memset(old, 0, sizeof *old); old->sa_handler = previous; }
++  return 0;
++}
++int kill(pid_t pid, int sig) {
++  if (pid != getpid() && pid != 0 && pid != -1) { errno = ESRCH; return -1; }
++  return sig ? raise(sig) : 0;
++}
+diff --git a/libc-bottom-half/sources/chdir.c b/libc-bottom-half/sources/chdir.c
+index 44e0fd9..25ea5d8 100644
+--- a/libc-bottom-half/sources/chdir.c
++++ b/libc-bottom-half/sources/chdir.c
+@@ -1,173 +1,52 @@
+-#include "lock.h"
++// The working directory belongs to the kernel (the app's WasmHost), as it does on any other system: this libc doesn't
++// keep one, and doesn't rewrite paths. A path goes to the host exactly as the program wrote it, through the `/` preopen,
++// so `/a` and `a` stay different calls; the kernel resolves it against the process's working directory.
+ #include <errno.h>
+-#include <fcntl.h>
+-#include <limits.h>
+-#include <lock.h>
++#include <stdint.h>
+ #include <stdlib.h>
+ #include <string.h>
+-#include <sys/stat.h>
+ #include <unistd.h>
+ #include <wasi/libc-find-relpath.h>
+-#include <wasi/libc.h>
+ 
+-DECLARE_WEAK_LOCK(__wasilibc_cwd_lock, extern);
+-extern char *__wasilibc_cwd;
+-static int __wasilibc_cwd_mallocd = 0;
++__attribute__((__import_module__("operator:system/process@0.1.0"), __import_name__("chdir")))
++extern int32_t __operator_chdir(const char *path, size_t length);
+ 
+-int chdir(const char *path) {
+-  static char *relative_buf = NULL;
+-  static size_t relative_buf_len = 0;
+-
+-  // Find a preopen'd directory as well as a relative path we're anchored
+-  // from which we're changing directories to.
+-  const char *abs;
+-  int parent_fd = __wasilibc_find_relpath_alloc(path, &abs, &relative_buf,
+-                                                &relative_buf_len, 1);
+-  if (parent_fd == -1)
+-    return -1;
+-
+-  // Make sure that this directory we're accessing is indeed a directory.
+-  struct stat dirinfo;
+-  int ret = fstatat(parent_fd, relative_buf, &dirinfo, 0);
+-  if (ret == -1)
+-    return -1;
+-  if (!S_ISDIR(dirinfo.st_mode)) {
+-    errno = ENOTDIR;
+-    return -1;
+-  }
++// Brings in the object that declares the import to the component linker.
++extern void __operator_system_force_link(void);
++__attribute__((used)) static void (*const force_link)(void) = __operator_system_force_link;
+ 
+-  // Create a string that looks like:
+-  //
+-  //    __wasilibc_cwd = "/" + abs + "/" + relative_buf
+-  //
+-  // If `relative_buf` is equal to "." or `abs` is equal to the empty string,
+-  // however, we skip that part and the middle slash.
+-  size_t abs_len = strlen(abs);
+-  int copy_relative = strcmp(relative_buf, ".") != 0;
+-  int mid = copy_relative && abs[0] != 0;
+-  char *new_cwd = malloc(1 + abs_len + mid +
+-                         (copy_relative ? strlen(relative_buf) : 0) + 1);
+-  if (new_cwd == NULL) {
+-    errno = ENOMEM;
++int chdir(const char *path) {
++  int32_t error = __operator_chdir(path, strlen(path));
++  if (error) {
++    errno = error;
+     return -1;
+   }
+-  new_cwd[0] = '/';
+-  strcpy(new_cwd + 1, abs);
+-  if (mid)
+-    new_cwd[1 + abs_len] = '/';
+-  if (copy_relative)
+-    strcpy(new_cwd + 1 + abs_len + mid, relative_buf);
+-
+-  // And set our new malloc'd buffer into the global cwd, freeing the
+-  // previous one if necessary.
+-  WEAK_LOCK(__wasilibc_cwd_lock);
+-  char *prev_cwd = __wasilibc_cwd;
+-  __wasilibc_cwd = new_cwd;
+-  WEAK_UNLOCK(__wasilibc_cwd_lock);
+-  if (__wasilibc_cwd_mallocd)
+-    free(prev_cwd);
+-  __wasilibc_cwd_mallocd = 1;
+   return 0;
+ }
+ 
+-// Computes an absolute path for `path` based on the current working directory.
+-//
+-// The caller must already hold `__wasilibc_cwd_lock`: this function reads the
+-// global cwd and writes the static `make_absolute_buf` (a pointer into which is
+-// returned), so both must stay stable until the caller is done with the result.
+-static const char *make_absolute(const char *path) {
+-  static char *make_absolute_buf = NULL;
+-  static size_t make_absolute_len = 0;
+-
+-  // If this path is absolute, then we return it as-is.
+-  if (path[0] == '/') {
+-    return path;
+-  }
+-
+-#ifndef _REENTRANT
+-  // If the path is empty, or points to the current directory, then return
+-  // the current directory.
+-  if (path[0] == 0 || !strcmp(path, ".") || !strcmp(path, "./")) {
+-    return __wasilibc_cwd;
+-  }
+-#endif
+-
+-  // If the path starts with `./` then we won't be appending that to the cwd.
+-  if (path[0] == '.' && path[1] == '/')
+-    path += 2;
+-
+-  // Otherwise we'll take the current directory, add a `/`, and then add the
+-  // input `path`. Note that this doesn't do any normalization (like removing
+-  // `/./`).
+-  size_t cwd_len = strlen(__wasilibc_cwd);
+-  size_t path_len = path ? strlen(path) : 0;
+-  int need_slash = __wasilibc_cwd[cwd_len - 1] == '/' ? 0 : 1;
+-  size_t alloc_len = cwd_len + path_len + 1 + need_slash;
+-  if (alloc_len > make_absolute_len) {
+-    char *tmp = realloc(make_absolute_buf, alloc_len);
+-    if (tmp == NULL) {
+-      return NULL;
+-    }
+-    make_absolute_buf = tmp;
+-    make_absolute_len = alloc_len;
+-  }
+-  strcpy(make_absolute_buf, __wasilibc_cwd);
+-
+-#ifdef _REENTRANT
+-  if (path[0] == 0 || !strcmp(path, ".") || !strcmp(path, "./")) {
+-    return make_absolute_buf;
+-  }
+-#endif
+-
+-  if (need_slash)
+-    strcpy(make_absolute_buf + cwd_len, "/");
+-  strcpy(make_absolute_buf + cwd_len + need_slash, path);
+-  return make_absolute_buf;
+-}
+-
+-// Helper function defined only in this object file and weakly referenced from
+-// `preopens.c` and `posix.c` This function isn't necessary unless `chdir` is
+-// pulled in because all paths are otherwise absolute or relative to the root.
++// Named in `posix.c` and `preopens.c`, which turn each path into a preopen and a path under it. There is one preopen, and
++// the path is left as it is.
+ int __wasilibc_find_relpath_alloc(const char *path, const char **abs_prefix,
+                                   char **relative_buf, size_t *relative_buf_len,
+                                   int can_realloc) {
+-  WEAK_LOCK(__wasilibc_cwd_lock);
+-
+-  // First, make our path absolute taking the cwd into account.
+-  const char *abspath = make_absolute(path);
+-  if (abspath == NULL) {
+-    WEAK_UNLOCK(__wasilibc_cwd_lock);
+-    errno = ENOMEM;
++  const char *rest;
++  int fd = __wasilibc_find_abspath("/", abs_prefix, &rest);
++  if (fd == -1)
+     return -1;
+-  }
+-
+-  // Next use our absolute path and split it. Find the preopened `fd` parent
+-  // directory and set `abs_prefix`. Next up we'll be trying to fit `rel`
+-  // into `relative_buf`.
+-  const char *rel;
+-  int fd = __wasilibc_find_abspath(abspath, abs_prefix, &rel);
+-  if (fd == -1) {
+-    WEAK_UNLOCK(__wasilibc_cwd_lock);
+-    return -1;
+-  }
+-
+-  size_t rel_len = strlen(rel);
+-  if (*relative_buf_len < rel_len + 1) {
++  size_t length = strlen(path) + 1;
++  if (*relative_buf_len < length) {
+     if (!can_realloc) {
+-      WEAK_UNLOCK(__wasilibc_cwd_lock);
+       errno = ERANGE;
+       return -1;
+     }
+-    char *tmp = realloc(*relative_buf, rel_len + 1);
+-    if (tmp == NULL) {
+-      WEAK_UNLOCK(__wasilibc_cwd_lock);
++    char *grown = realloc(*relative_buf, length);
++    if (!grown) {
+       errno = ENOMEM;
+       return -1;
+     }
+-    *relative_buf = tmp;
+-    *relative_buf_len = rel_len + 1;
++    *relative_buf = grown;
++    *relative_buf_len = length;
+   }
+-  strcpy(*relative_buf, rel);
+-  WEAK_UNLOCK(__wasilibc_cwd_lock);
++  memcpy(*relative_buf, path, length);
+   return fd;
+ }
+diff --git a/libc-bottom-half/sources/file.c b/libc-bottom-half/sources/file.c
+index 6e0c224..dc24f03 100644
+--- a/libc-bottom-half/sources/file.c
++++ b/libc-bottom-half/sources/file.c
+@@ -221,6 +221,36 @@ static int file_get_file(void *data, filesystem_borrow_descriptor_t *out_file) {
+   return 0;
+ }
+ 
++// A socket is a file of the kernel's (operator_system.c): reading and writing are a file's, and these are the rest.
++extern int __operator_connect(int, const struct sockaddr *, socklen_t);
++extern int __operator_bind(int, const struct sockaddr *, socklen_t);
++extern int __operator_listen(int, int);
++extern int __operator_accept(int, struct sockaddr *, socklen_t *);
++extern int __operator_socket_name(int, int, struct sockaddr *, socklen_t *);
++extern int __operator_shutdown(int, int);
++extern ssize_t __operator_send_to(int, const void *, size_t, const struct sockaddr *, socklen_t);
++extern ssize_t __operator_receive_from(int, void *, size_t, int, struct sockaddr *, socklen_t *);
++extern int __operator_get_option(int, int, int, void *, socklen_t *);
++extern int __operator_set_option(int, int, int, const void *, socklen_t);
++
++#define HANDLE(data) (((file_t *)(data))->file_handle.__handle)
++static int file_connect(void *data, const struct sockaddr *address, socklen_t size) { return __operator_connect(HANDLE(data), address, size); }
++static int file_bind(void *data, const struct sockaddr *address, socklen_t size) { return __operator_bind(HANDLE(data), address, size); }
++static int file_listen(void *data, int backlog) { return __operator_listen(HANDLE(data), backlog); }
++static int file_accept4(void *data, struct sockaddr *address, socklen_t *size, int flags) { (void)flags; return __operator_accept(HANDLE(data), address, size); }
++static int file_getsockname(void *data, struct sockaddr *address, socklen_t *size) { return __operator_socket_name(HANDLE(data), 0, address, size); }
++static int file_getpeername(void *data, struct sockaddr *address, socklen_t *size) { return __operator_socket_name(HANDLE(data), 1, address, size); }
++static int file_shutdown(void *data, int how) { return __operator_shutdown(HANDLE(data), how); }
++static ssize_t file_sendto(void *data, const void *buffer, size_t length, int flags, const struct sockaddr *address, socklen_t size) {
++  (void)flags;
++  return __operator_send_to(HANDLE(data), buffer, length, address, size);
++}
++static ssize_t file_recvfrom(void *data, void *buffer, size_t length, int flags, struct sockaddr *address, socklen_t *size) {
++  return __operator_receive_from(HANDLE(data), buffer, length, flags, address, size);
++}
++static int file_getsockopt(void *data, int level, int name, void *value, socklen_t *size) { return __operator_get_option(HANDLE(data), level, name, value, size); }
++static int file_setsockopt(void *data, int level, int name, const void *value, socklen_t size) { return __operator_set_option(HANDLE(data), level, name, value, size); }
++
+ static int file_fstat(void *data, struct stat *buf) {
+   file_t *file = (file_t *)data;
+   // Get the metadata hash for the file descriptor
+@@ -324,6 +354,8 @@ static int file_set_blocking(void *data, bool blocking) {
+     file->oflag &= ~O_NONBLOCK;
+   else
+     file->oflag |= O_NONBLOCK;
++  extern void __operator_set_nonblocking(int, int);
++  __operator_set_nonblocking(file->file_handle.__handle, !blocking);
+   return 0;
+ }
+ 
+@@ -365,6 +397,8 @@ static int file_fcntl_setfl(void *data, int flags) {
+ 
+   flags &= O_NONBLOCK | O_APPEND;
+   file->oflag = (file->oflag & ~(O_NONBLOCK | O_APPEND)) | flags;
++  extern void __operator_set_nonblocking(int, int);
++  __operator_set_nonblocking(file->file_handle.__handle, (flags & O_NONBLOCK) != 0);
+   return 0;
+ }
+ 
+@@ -373,6 +407,9 @@ static descriptor_vtable_t file_vtable = {
+     .get_read_stream = file_get_read_stream,
+     .get_write_stream = file_get_write_stream,
+     .get_file = file_get_file,
++    .connect = file_connect, .bind = file_bind, .listen = file_listen, .accept4 = file_accept4,
++    .getsockname = file_getsockname, .getpeername = file_getpeername, .shutdown = file_shutdown,
++    .sendto = file_sendto, .recvfrom = file_recvfrom, .getsockopt = file_getsockopt, .setsockopt = file_setsockopt,
+     .set_blocking = file_set_blocking,
+     .fstat = file_fstat,
+     .seek = file_seek,
+@@ -394,5 +431,9 @@ int __wasilibc_add_file(filesystem_own_descriptor_t file_handle, int oflag) {
+   descriptor_table_entry_t entry;
+   entry.vtable = &file_vtable;
+   entry.data = &file->refcnt;
+-  return descriptor_table_insert(entry);
++  int fd = descriptor_table_insert(entry);
++  extern void __operator_note_socket(int, int);
++  if (fd >= 0)
++    __operator_note_socket(fd, 0);
++  return fd;
+ }
+diff --git a/libc-bottom-half/sources/getcwd.c b/libc-bottom-half/sources/getcwd.c
+index 7786bfb..1234cd6 100644
+--- a/libc-bottom-half/sources/getcwd.c
++++ b/libc-bottom-half/sources/getcwd.c
+@@ -1,31 +1,38 @@
+ #include <errno.h>
++#include <stdlib.h>
+ #include <string.h>
+ #include <unistd.h>
+ 
+-#include "lock.h"
++struct string {
++  char *pointer;
++  size_t length;
++};
+ 
+-char *__wasilibc_cwd = "/";
+-DECLARE_WEAK_LOCK(__wasilibc_cwd_lock);
++__attribute__((__import_module__("operator:system/process@0.1.0"), __import_name__("getcwd")))
++extern void __operator_getcwd(struct string *result);
++
++// Brings in the object that declares the import to the component linker.
++extern void __operator_system_force_link(void);
++__attribute__((used)) static void (*const force_link)(void) = __operator_system_force_link;
+ 
+ char *getcwd(char *buf, size_t size) {
+-  // Critical section contains no yield points, so we can use weak locks.
+-  WEAK_LOCK(__wasilibc_cwd_lock);
++  struct string path = {0, 0};
++  __operator_getcwd(&path);
+   if (!buf) {
+-    buf = strdup(__wasilibc_cwd);
++    size = path.length + 1;
++    buf = malloc(size);
+     if (!buf) {
++      free(path.pointer);
+       errno = ENOMEM;
+-      WEAK_UNLOCK(__wasilibc_cwd_lock);
+-      return NULL;
+-    }
+-  } else {
+-    size_t len = strlen(__wasilibc_cwd);
+-    if (size < len + 1) {
+-      errno = ERANGE;
+-      WEAK_UNLOCK(__wasilibc_cwd_lock);
+       return NULL;
+     }
+-    strcpy(buf, __wasilibc_cwd);
++  } else if (size < path.length + 1) {
++    free(path.pointer);
++    errno = ERANGE;
++    return NULL;
+   }
+-  WEAK_UNLOCK(__wasilibc_cwd_lock);
++  memcpy(buf, path.pointer, path.length);
++  buf[path.length] = 0;
++  free(path.pointer);
+   return buf;
+ }
+diff --git a/libc-bottom-half/sources/netdb.c b/libc-bottom-half/sources/netdb.c
+index c1cd927..f6d448d 100644
+--- a/libc-bottom-half/sources/netdb.c
++++ b/libc-bottom-half/sources/netdb.c
+@@ -206,169 +206,6 @@ static sockets_ip_address_t ipv6_address(const uint8_t *b) {
+   };
+ }
+ 
+-int getaddrinfo(const char *restrict host, const char *restrict serv,
+-                const struct addrinfo *restrict hint,
+-                struct addrinfo **restrict res) {
+-  *res = NULL;
+-
+-  int flags = hint ? hint->ai_flags : 0;
+-  if (flags & ~(AI_PASSIVE | AI_CANONNAME | AI_NUMERICHOST | AI_V4MAPPED |
+-                AI_ALL | AI_ADDRCONFIG | AI_NUMERICSERV))
+-    return EAI_BADFLAGS;
+-
+-  int family = hint ? hint->ai_family : AF_UNSPEC;
+-  if (family != AF_UNSPEC && family != AF_INET && family != AF_INET6)
+-    return EAI_FAMILY;
+-
+-  int socktype = hint ? hint->ai_socktype : 0;
+-  if (socktype != 0 && socktype != SOCK_STREAM && socktype != SOCK_DGRAM)
+-    return EAI_SOCKTYPE;
+-
+-  if (host == NULL && serv == NULL)
+-    return EAI_NONAME;
+-
+-  // The 'serv' parameter can be either a port number or a service name. By
+-  // default an entry is generated for both TCP and UDP; a service table
+-  // entry and/or the socktype hint narrow that down.
+-  int port = 0;
+-  uint16_t protocol = SERVICE_PROTOCOL_TCP | SERVICE_PROTOCOL_UDP;
+-  if (serv != NULL) {
+-    port = __wasilibc_parse_port(serv);
+-    if (port < 0) {
+-      if (flags & AI_NUMERICSERV)
+-        return EAI_NONAME;
+-      const service_entry_t *service =
+-          __wasilibc_get_service_entry_by_name(serv);
+-      if (service == NULL)
+-        return EAI_NONAME;
+-      port = service->port;
+-      protocol = service->protocol;
+-    }
+-  }
+-  if (socktype == SOCK_STREAM)
+-    protocol &= SERVICE_PROTOCOL_TCP;
+-  else if (socktype == SOCK_DGRAM)
+-    protocol &= SERVICE_PROTOCOL_UDP;
+-  if (protocol == 0)
+-    return EAI_SERVICE;
+-
+-  // Handle addresses which don't require the resolver: a NULL host maps to
+-  // the wildcard (AI_PASSIVE) or loopback address locally, and numeric
+-  // literals are parsed directly. Only fall through to the resolver for a
+-  // non-numeric hostname, and only when AI_NUMERICHOST permits it.
+-  sockets_ip_address_t local[2];
+-  size_t num_local = 0;
+-  struct in_addr a4;
+-  struct in6_addr a6;
+-  if (host == NULL) {
+-    if (family != AF_INET6) {
+-      static const uint8_t any4[4] = {0, 0, 0, 0};
+-      static const uint8_t loopback4[4] = {127, 0, 0, 1};
+-      local[num_local++] = ipv4_address(flags & AI_PASSIVE ? any4 : loopback4);
+-    }
+-    if (family != AF_INET) {
+-      const struct in6_addr *a =
+-          flags & AI_PASSIVE ? &in6addr_any : &in6addr_loopback;
+-      local[num_local++] = ipv6_address(a->s6_addr);
+-    }
+-  } else if (inet_pton(AF_INET, host, &a4) == 1) {
+-    if (family == AF_INET6)
+-      return EAI_NONAME;
+-    local[num_local++] = ipv4_address((const uint8_t *)&a4.s_addr);
+-  } else if (inet_pton(AF_INET6, host, &a6) == 1) {
+-    if (family == AF_INET)
+-      return EAI_NONAME;
+-    local[num_local++] = ipv6_address(a6.s6_addr);
+-  } else if (flags & AI_NUMERICHOST) {
+-    return EAI_NONAME;
+-  }
+-
+-  struct addrinfo *result = NULL;
+-  defer freeaddrinfo(result);
+-  struct addrinfo *current = NULL;
+-
+-  if (num_local > 0) {
+-    for (size_t i = 0; i < num_local; i++) {
+-      if (protocol & SERVICE_PROTOCOL_TCP &&
+-          !add_addr(local[i], htons(port), SOCK_STREAM, hint, &current,
+-                    &result))
+-        return EAI_MEMORY;
+-      if (protocol & SERVICE_PROTOCOL_UDP &&
+-          !add_addr(local[i], htons(port), SOCK_DGRAM, hint, &current, &result))
+-        return EAI_MEMORY;
+-    }
+-  } else {
+-    wasi_string_t name = {.ptr = (uint8_t *)host, .len = strlen(host)};
+-    ip_name_lookup_error_code_t error;
+-#ifdef __wasip2__
+-    ip_name_lookup_own_resolve_address_stream_t stream;
+-    if (!ip_name_lookup_resolve_addresses(
+-            __wasi_sockets_utils__borrow_network(), &name, &stream, &error))
+-      return map_error(&error);
+-    ip_name_lookup_borrow_resolve_address_stream_t stream_borrow =
+-        ip_name_lookup_borrow_resolve_address_stream(stream);
+-    poll_own_pollable_t pollable;
+-    pollable.__handle = 0;
+-#else
+-    ip_name_lookup_list_ip_address_t addresses;
+-    if (!ip_name_lookup_resolve_addresses(&name, &addresses, &error))
+-      return map_error(&error);
+-    size_t next = 0;
+-#endif
+-
+-    while (1) {
+-#ifdef __wasip2__
+-      ip_name_lookup_option_ip_address_t maybe_address;
+-      if (!ip_name_lookup_method_resolve_address_stream_resolve_next_address(
+-              stream_borrow, &maybe_address, &error)) {
+-        if (error != NETWORK_ERROR_CODE_WOULD_BLOCK)
+-          return map_error(&error);
+-
+-        if (pollable.__handle == 0) {
+-          pollable = ip_name_lookup_method_resolve_address_stream_subscribe(
+-              stream_borrow);
+-        }
+-        poll_method_pollable_block(poll_borrow_pollable(pollable));
+-        continue;
+-      }
+-      if (!maybe_address.is_some)
+-        break;
+-      sockets_ip_address_t address = maybe_address.val;
+-
+-#else
+-      if (next == addresses.len)
+-        break;
+-      sockets_ip_address_t address = addresses.ptr[next++];
+-#endif
+-      if (protocol & SERVICE_PROTOCOL_TCP &&
+-          !add_addr(address, htons(port), SOCK_STREAM, hint, &current, &result))
+-        return EAI_MEMORY;
+-      if (protocol & SERVICE_PROTOCOL_UDP &&
+-          !add_addr(address, htons(port), SOCK_DGRAM, hint, &current, &result))
+-        return EAI_MEMORY;
+-    }
+-
+-#ifdef __wasip2__
+-    if (pollable.__handle != 0)
+-      poll_pollable_drop_own(pollable);
+-    ip_name_lookup_resolve_address_stream_drop_own(stream);
+-#else
+-    ip_name_lookup_list_ip_address_free(&addresses);
+-#endif
+-  }
+-
+-  // If a canonical name is asked for just give what was passed in.
+-  if (result != NULL && host != NULL && flags & AI_CANONNAME) {
+-    result->ai_canonname = strdup(host);
+-    if (result->ai_canonname == NULL)
+-      return EAI_MEMORY;
+-  }
+-
+-  *res = result;
+-  result = NULL;
+-  return 0;
+-}
+-
+ void freeaddrinfo(struct addrinfo *p) {
+   while (p) {
+     struct addrinfo *next = p->ai_next;
+@@ -379,27 +216,6 @@ void freeaddrinfo(struct addrinfo *p) {
+   }
+ }
+ 
+-int getnameinfo(const struct sockaddr *restrict sa, socklen_t salen,
+-                char *restrict host, socklen_t hostlen, char *restrict serv,
+-                socklen_t servlen, int flags) {
+-  (void)sa;
+-  (void)salen;
+-  (void)host;
+-  (void)hostlen;
+-  (void)serv;
+-  (void)servlen;
+-  (void)flags;
+-  // TODO wasi-sockets
+-  errno = EOPNOTSUPP;
+-  return EAI_SYSTEM;
+-}
+-
+-struct hostent *gethostbyname(const char *name) {
+-  (void)name;
+-  // TODO wasi-sockets
+-  return NULL;
+-}
+-
+ struct hostent *gethostbyaddr(const void *addr, socklen_t len, int type) {
+   (void)addr;
+   (void)len;
+diff --git a/libc-bottom-half/sources/operator_system.c b/libc-bottom-half/sources/operator_system.c
+new file mode 100644
+index 0000000..0e1762c
+--- /dev/null
++++ b/libc-bottom-half/sources/operator_system.c
+@@ -0,0 +1,1006 @@
++// What this libc asks of the app's kernel beyond WASI (WasmHost.swift, wasm-direct.js).
++#define _WASI_EMULATED_SIGNAL
++#define _WASI_EMULATED_PROCESS_CLOCKS
++#define _GNU_SOURCE
++#define _ALL_SOURCE
++#include <errno.h>
++#include <stdint.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#define KERNEL(name) __attribute__((__import_module__("operator:system/process@0.1.0"), __import_name__(name)))
++
++extern void __operator_system_force_link(void);
++__attribute__((used)) static void (*const force_link)(void) = __operator_system_force_link;
++
++KERNEL("getpid") extern int32_t kernel_getpid(void);
++KERNEL("getppid") extern int32_t kernel_getppid(void);
++KERNEL("getuid") extern uint32_t kernel_getuid(void);
++KERNEL("getgid") extern uint32_t kernel_getgid(void);
++KERNEL("access") extern int32_t kernel_access(const char *path, size_t length, int32_t mode);
++KERNEL("file-mode") extern int32_t kernel_file_mode(const char *path, size_t length, int32_t follow);
++KERNEL("chmod") extern int32_t kernel_chmod(const char *path, size_t length, int32_t mode);
++
++pid_t getpid(void) { return kernel_getpid(); }
++pid_t getppid(void) { return kernel_getppid(); }
++uid_t getuid(void) { return kernel_getuid(); }
++uid_t geteuid(void) { return kernel_getuid(); }
++gid_t getgid(void) { return kernel_getgid(); }
++gid_t getegid(void) { return kernel_getgid(); }
++
++static int check(int32_t error) {
++  if (error) {
++    errno = error;
++    return -1;
++  }
++  return 0;
++}
++
++int __operator_access(const char *path, int mode) { return check(kernel_access(path, strlen(path), mode)); }
++int __operator_chmod(const char *path, mode_t mode) { return check(kernel_chmod(path, strlen(path), mode)); }
++int __operator_file_mode(const char *path, int follow) { return kernel_file_mode(path, strlen(path), follow); }
++
++// MARK: - Files
++
++#include <arpa/inet.h>
++#include <fcntl.h>
++#include <grp.h>
++#include <netdb.h>
++#include <netinet/in.h>
++#include <poll.h>
++#include <pwd.h>
++#include <spawn.h>
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <sys/file.h>
++#include <sys/resource.h>
++#include <sys/socket.h>
++#include <sys/statvfs.h>
++#include <sys/wait.h>
++#include <termios.h>
++#include <wasi/descriptor_table.h>
++#include <wasi/file.h>
++
++int __operator_record_lock(int fd, int command, struct flock *lock);
++int __operator_socket_name(int file, int peer, struct sockaddr *address, socklen_t *size);
++
++struct string {
++  char *pointer;
++  size_t length;
++};
++
++KERNEL("fchmod") extern int32_t kernel_fchmod(uint32_t file, int32_t mode);
++KERNEL("chown") extern int32_t kernel_chown(const char *path, size_t length, int32_t uid, int32_t gid, int32_t follow);
++KERNEL("mkfifo") extern int32_t kernel_mkfifo(const char *path, size_t length, int32_t mode);
++KERNEL("fchdir") extern int32_t kernel_fchdir(uint32_t file);
++KERNEL("create-mode") extern void kernel_create_mode(int32_t mode);
++KERNEL("flock") extern int32_t kernel_flock(uint32_t file, int32_t operation);
++KERNEL("lock") extern int32_t kernel_lock(uint32_t file, int32_t command, int32_t kind, int64_t start, int64_t length);
++KERNEL("statfs") extern void kernel_statfs(const char *path, size_t length, struct string *result);
++KERNEL("processors") extern int32_t kernel_processors(void);
++KERNEL("run") extern int32_t kernel_run(const char *command, size_t command_length, const char *input, size_t input_length,
++                                        const char *output, size_t output_length, const char *program, size_t program_length);
++KERNEL("socket") extern int32_t kernel_socket(int32_t domain, int32_t kind, int32_t protocol);
++KERNEL("connect") extern int32_t kernel_connect(uint32_t file, const char *address, size_t length, int32_t port);
++KERNEL("bind") extern int32_t kernel_bind(uint32_t file, const char *address, size_t length, int32_t port);
++KERNEL("listen") extern int32_t kernel_listen(uint32_t file, int32_t backlog);
++KERNEL("accept") extern int32_t kernel_accept(uint32_t file);
++KERNEL("socket-name") extern void kernel_socket_name(uint32_t file, int32_t peer, struct string *result);
++KERNEL("shutdown") extern int32_t kernel_shutdown(uint32_t file, int32_t how);
++KERNEL("send-to") extern int32_t kernel_send_to(uint32_t file, const void *data, size_t size, const char *address, size_t length, int32_t port);
++KERNEL("receive-from") extern void kernel_receive_from(uint32_t file, uint32_t length, int32_t peek, struct string *result);
++KERNEL("socket-option") extern int32_t kernel_socket_option(uint32_t file, int32_t name, int32_t value, int32_t set);
++KERNEL("poll") extern void kernel_poll(const void *entries, size_t size, int32_t timeout, struct string *result);
++KERNEL("resolve") extern void kernel_resolve(const char *host, size_t length, struct string *result);
++
++/// The kernel's handle for `fd`, or -1 (errno set).
++static int file_of(int fd) {
++  descriptor_table_entry_t entry;
++  filesystem_borrow_descriptor_t file;
++  if (descriptor_table_get(fd, &entry) < 0)
++    return -1;
++  if (!entry.vtable->get_file || entry.vtable->get_file(entry.data, &file) < 0) {
++    errno = EBADF;
++    return -1;
++  }
++  return file.__handle;
++}
++
++static mode_t process_umask = 022;
++
++mode_t umask(mode_t mask) {
++  mode_t previous = process_umask;
++  process_umask = mask & 0777;
++  return previous;
++}
++
++void __operator_create_mode(mode_t mode) { kernel_create_mode((mode & 07777) & ~process_umask); }
++
++int fchmod(int fd, mode_t mode) {
++  int file = file_of(fd);
++  return file < 0 ? -1 : check(kernel_fchmod(file, mode));
++}
++
++int fchmodat(int fd, const char *path, mode_t mode, int flags) {
++  (void)flags;
++  if (fd != AT_FDCWD && path[0] != '/') {
++    errno = ENOTSUP;
++    return -1;
++  }
++  return __operator_chmod(path, mode);
++}
++
++int chown(const char *path, uid_t uid, gid_t gid) { return check(kernel_chown(path, strlen(path), uid, gid, 1)); }
++int lchown(const char *path, uid_t uid, gid_t gid) { return check(kernel_chown(path, strlen(path), uid, gid, 0)); }
++int fchown(int fd, uid_t uid, gid_t gid) {
++  if (file_of(fd) < 0)
++    return -1;
++  if (uid != (uid_t)-1 && uid != getuid()) {
++    errno = EPERM;
++    return -1;
++  }
++  if (gid != (gid_t)-1 && gid != getgid()) {
++    errno = EPERM;
++    return -1;
++  }
++  return 0;
++}
++
++int mkfifo(const char *path, mode_t mode) { return check(kernel_mkfifo(path, strlen(path), (mode & 07777) & ~process_umask)); }
++
++int fchdir(int fd) {
++  int file = file_of(fd);
++  return file < 0 ? -1 : check(kernel_fchdir(file));
++}
++
++int flock(int fd, int operation) {
++  int file = file_of(fd);
++  return file < 0 ? -1 : check(kernel_flock(file, operation));
++}
++
++int lockf(int fd, int operation, off_t size) {
++  struct flock lock = {.l_type = F_WRLCK, .l_whence = SEEK_CUR, .l_len = size};
++  switch (operation) {
++  case F_ULOCK:
++    lock.l_type = F_UNLCK;
++    return __operator_record_lock(fd, F_SETLK, &lock);
++  case F_LOCK:
++    return __operator_record_lock(fd, F_SETLKW, &lock);
++  case F_TLOCK:
++    return __operator_record_lock(fd, F_SETLK, &lock);
++  case F_TEST:
++    if (__operator_record_lock(fd, F_GETLK, &lock) < 0)
++      return -1;
++    if (lock.l_type == F_UNLCK)
++      return 0;
++    errno = EAGAIN;
++    return -1;
++  }
++  errno = EINVAL;
++  return -1;
++}
++
++int __operator_record_lock(int fd, int command, struct flock *lock) {
++  int file = file_of(fd);
++  if (file < 0)
++    return -1;
++  off_t start = lock->l_start;
++  if (lock->l_whence == SEEK_CUR) {
++    off_t position = lseek(fd, 0, SEEK_CUR);
++    if (position >= 0)
++      start += position;
++  } else if (lock->l_whence == SEEK_END) {
++    struct stat info;
++    if (fstat(fd, &info) == 0)
++      start += info.st_size;
++  }
++  int kind = lock->l_type == F_RDLCK ? 0 : lock->l_type == F_WRLCK ? 1 : 2;
++  int32_t result = kernel_lock(file, command == F_GETLK ? 0 : command == F_SETLK ? 1 : 2, kind, start, lock->l_len);
++  if (result < 0) {
++    errno = -result;
++    return -1;
++  }
++  if (command == F_GETLK)
++    lock->l_type = result == 0 ? F_UNLCK : result == 1 ? F_RDLCK : F_WRLCK;
++  return 0;
++}
++
++static int statfs_of(const char *path, struct statvfs *buffer) {
++  struct string text = {0, 0};
++  kernel_statfs(path, strlen(path), &text);
++  if (!text.length) {
++    free(text.pointer);
++    errno = ENOENT;
++    return -1;
++  }
++  char copy[96] = {0};
++  memcpy(copy, text.pointer, text.length < 95 ? text.length : 95);
++  free(text.pointer);
++  unsigned long long size = 0, blocks = 0, available = 0;
++  sscanf(copy, "%llu %llu %llu", &size, &blocks, &available);
++  memset(buffer, 0, sizeof *buffer);
++  buffer->f_bsize = buffer->f_frsize = size;
++  buffer->f_blocks = blocks;
++  buffer->f_bfree = buffer->f_bavail = available;
++  buffer->f_namemax = 255;
++  return 0;
++}
++
++int statvfs(const char *restrict path, struct statvfs *restrict buffer) { return statfs_of(path, buffer); }
++int fstatvfs(int fd, struct statvfs *buffer) {
++  struct stat info;
++  if (fstat(fd, &info) < 0)
++    return -1;
++  return statfs_of("/", buffer);
++}
++
++int __operator_processors(void) { return kernel_processors(); }
++
++// MARK: - Temporary files
++
++static int fill_template(char *template, size_t suffix, int (*attempt)(const char *, int), int flags) {
++  size_t length = strlen(template);
++  if (length < 6 + suffix || memcmp(template + length - suffix - 6, "XXXXXX", 6)) {
++    errno = EINVAL;
++    return -1;
++  }
++  static const char letters[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
++  char *name = template + length - suffix - 6;
++  for (int tries = 0; tries < 100; tries++) {
++    unsigned char random[6];
++    getentropy(random, sizeof random);
++    for (int i = 0; i < 6; i++)
++      name[i] = letters[random[i] % (sizeof letters - 1)];
++    int result = attempt(template, flags);
++    if (result >= 0 || errno != EEXIST)
++      return result;
++  }
++  memcpy(name, "XXXXXX", 6);
++  errno = EEXIST;
++  return -1;
++}
++
++static int create_file(const char *path, int flags) { return open(path, O_RDWR | O_CREAT | O_EXCL | flags, 0600); }
++static int create_folder(const char *path, int flags) {
++  (void)flags;
++  return mkdir(path, 0700);
++}
++
++int mkostemps(char *template, int suffix, int flags) { return fill_template(template, suffix, create_file, flags); }
++int mkostemp(char *template, int flags) { return mkostemps(template, 0, flags); }
++int mkstemps(char *template, int suffix) { return mkostemps(template, suffix, 0); }
++int mkstemp(char *template) { return mkostemps(template, 0, 0); }
++char *mkdtemp(char *template) { return fill_template(template, 0, create_folder, 0) < 0 ? NULL : template; }
++
++static int no_file(const char *path, int flags) {
++  (void)flags;
++  struct stat info;
++  if (lstat(path, &info) == 0) {
++    errno = EEXIST;
++    return -1;
++  }
++  return 0;
++}
++
++char *mktemp(char *template) {
++  if (fill_template(template, 0, no_file, 0) < 0)
++    template[0] = 0;
++  return template;
++}
++
++char *tmpnam(char *buffer) {
++  static char name[L_tmpnam];
++  char *result = buffer ? buffer : name;
++  strcpy(result, "/tmp/tmpnam_XXXXXX");
++  return fill_template(result, 0, no_file, 0) < 0 ? NULL : result;
++}
++
++char *tempnam(const char *folder, const char *prefix) {
++  char *result = NULL;
++  if (asprintf(&result, "%s/%sXXXXXX", folder ? folder : "/tmp", prefix ? prefix : "tmp") < 0)
++    return NULL;
++  if (fill_template(result, 0, no_file, 0) < 0) {
++    free(result);
++    return NULL;
++  }
++  return result;
++}
++
++FILE *tmpfile(void) {
++  char name[] = "/tmp/tmpfile_XXXXXX";
++  int fd = mkstemp(name);
++  if (fd < 0)
++    return NULL;
++  unlink(name);
++  return fdopen(fd, "w+");
++}
++
++// MARK: - Commands
++
++static int run(const char *command, const char *input, const char *output, const char *program) {
++  fflush(NULL);
++  return kernel_run(command, strlen(command), input, strlen(input), output, strlen(output), program, strlen(program));
++}
++
++int system(const char *command) {
++  if (!command)
++    return 1;
++  return run(command, "", "", "");
++}
++
++// popen runs the command to its end: for reading when it's opened, into a file, and for writing when it's closed, from one.
++#define MAX_PIPES 16
++static struct {
++  FILE *file;
++  char path[32];
++  char *command;
++  int status;
++} pipes[MAX_PIPES];
++
++FILE *popen(const char *command, const char *mode) {
++  int slot = 0;
++  while (slot < MAX_PIPES && pipes[slot].file)
++    slot++;
++  if (slot == MAX_PIPES || (mode[0] != 'r' && mode[0] != 'w')) {
++    errno = slot == MAX_PIPES ? EMFILE : EINVAL;
++    return NULL;
++  }
++  strcpy(pipes[slot].path, "/tmp/popen_XXXXXX");
++  int fd = mkstemp(pipes[slot].path);
++  if (fd < 0)
++    return NULL;
++  if (mode[0] == 'r') {
++    close(fd);
++    pipes[slot].status = run(command, "", pipes[slot].path, "");
++    pipes[slot].file = fopen(pipes[slot].path, "r");
++    unlink(pipes[slot].path);
++  } else {
++    pipes[slot].command = strdup(command);
++    pipes[slot].file = fdopen(fd, "w");
++  }
++  return pipes[slot].file;
++}
++
++int pclose(FILE *file) {
++  for (int slot = 0; slot < MAX_PIPES; slot++) {
++    if (pipes[slot].file != file)
++      continue;
++    fclose(file);
++    pipes[slot].file = NULL;
++    if (pipes[slot].command) {
++      pipes[slot].status = run(pipes[slot].command, pipes[slot].path, "", "");
++      free(pipes[slot].command);
++      pipes[slot].command = NULL;
++      unlink(pipes[slot].path);
++    }
++    return pipes[slot].status;
++  }
++  errno = ECHILD;
++  return -1;
++}
++
++/// The arguments after argv[0], quoted for the shell.
++static char *quoted(char *const argv[]) {
++  size_t size = 1;
++  for (int i = 1; argv[i]; i++)
++    size += 4 * strlen(argv[i]) + 3;
++  char *text = malloc(size), *end = text;
++  if (!text)
++    return NULL;
++  for (int i = 1; argv[i]; i++) {
++    *end++ = '\'';
++    for (const char *c = argv[i]; *c; c++) {
++      if (*c == '\'') {
++        memcpy(end, "'\\''", 4);
++        end += 4;
++      } else {
++        *end++ = *c;
++      }
++    }
++    *end++ = '\'';
++    *end++ = ' ';
++  }
++  *end = 0;
++  return text;
++}
++
++/// Replacing the program: the kernel runs the new one, and this one ends with its status.
++int execvp(const char *file, char *const argv[]) {
++  char *arguments = quoted(argv);
++  if (!arguments) {
++    errno = ENOMEM;
++    return -1;
++  }
++  int status = run(arguments, "", "", file);
++  free(arguments);
++  _Exit(WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status));
++}
++
++int execv(const char *path, char *const argv[]) { return execvp(path, argv); }
++int execve(const char *path, char *const argv[], char *const environment[]) {
++  (void)environment;
++  return execvp(path, argv);
++}
++
++static char **collect(const char *first, va_list arguments, char ***after) {
++  va_list counting;
++  va_copy(counting, arguments);
++  size_t count = 2;
++  while (va_arg(counting, char *))
++    count++;
++  va_end(counting);
++  char **list = calloc(count + 1, sizeof(char *));
++  if (!list)
++    return NULL;
++  list[0] = (char *)first;
++  size_t i = 1;
++  for (char *item; (item = va_arg(arguments, char *)); i++)
++    list[i] = item;
++  list[i] = NULL;
++  if (after)
++    *after = va_arg(arguments, char **);
++  return list;
++}
++
++int execl(const char *path, const char *first, ...) {
++  va_list arguments;
++  va_start(arguments, first);
++  char **list = collect(first, arguments, NULL);
++  va_end(arguments);
++  return list ? execv(path, list) : -1;
++}
++
++int execlp(const char *file, const char *first, ...) {
++  va_list arguments;
++  va_start(arguments, first);
++  char **list = collect(first, arguments, NULL);
++  va_end(arguments);
++  return list ? execvp(file, list) : -1;
++}
++
++int execle(const char *path, const char *first, ...) {
++  va_list arguments;
++  va_start(arguments, first);
++  char **list = collect(first, arguments, NULL);
++  va_end(arguments);
++  return list ? execv(path, list) : -1;
++}
++
++/// WebAssembly can't copy a running program.
++pid_t fork(void) {
++  errno = ENOSYS;
++  return -1;
++}
++
++// A spawned program has already finished: wait collects what it left.
++static struct {
++  pid_t pid;
++  int status;
++} children[64];
++static pid_t next_child = 1;
++
++int posix_spawnp(pid_t *restrict pid, const char *restrict file, const posix_spawn_file_actions_t *actions,
++                 const posix_spawnattr_t *restrict attributes, char *const argv[restrict], char *const environment[restrict]) {
++  (void)attributes;
++  (void)environment;
++  if (actions && actions->__actions)
++    return ENOTSUP;
++  char *arguments = quoted(argv);
++  if (!arguments)
++    return ENOMEM;
++  int status = run(arguments, "", "", file);
++  free(arguments);
++  for (size_t i = 0; i < sizeof children / sizeof *children; i++) {
++    if (!children[i].pid) {
++      children[i].pid = next_child++ + getpid();
++      children[i].status = status;
++      if (pid)
++        *pid = children[i].pid;
++      return 0;
++    }
++  }
++  return EAGAIN;
++}
++
++int posix_spawn(pid_t *restrict pid, const char *restrict path, const posix_spawn_file_actions_t *actions,
++                const posix_spawnattr_t *restrict attributes, char *const argv[restrict], char *const environment[restrict]) {
++  return posix_spawnp(pid, path, actions, attributes, argv, environment);
++}
++
++int posix_spawn_file_actions_init(posix_spawn_file_actions_t *actions) {
++  memset(actions, 0, sizeof *actions);
++  return 0;
++}
++int posix_spawn_file_actions_destroy(posix_spawn_file_actions_t *actions) {
++  (void)actions;
++  return 0;
++}
++int posix_spawnattr_init(posix_spawnattr_t *attributes) {
++  memset(attributes, 0, sizeof *attributes);
++  return 0;
++}
++int posix_spawnattr_destroy(posix_spawnattr_t *attributes) {
++  (void)attributes;
++  return 0;
++}
++
++pid_t waitpid(pid_t pid, int *status, int options) {
++  (void)options;
++  for (size_t i = 0; i < sizeof children / sizeof *children; i++) {
++    if (children[i].pid && (pid <= 0 || children[i].pid == pid)) {
++      pid_t found = children[i].pid;
++      if (status)
++        *status = children[i].status;
++      children[i].pid = 0;
++      return found;
++    }
++  }
++  errno = ECHILD;
++  return -1;
++}
++
++pid_t wait(int *status) { return waitpid(-1, status, 0); }
++
++// MARK: - Users, limits, terminals
++
++static char *user_name(void) {
++  char *name = getenv("USER");
++  return name && *name ? name : "mobile";
++}
++
++static struct passwd *the_user(void) {
++  static struct passwd entry;
++  entry = (struct passwd){user_name(), "*", getuid(), getgid(), "", "/", "/bin/sh"};
++  return &entry;
++}
++
++struct passwd *getpwuid(uid_t uid) { return uid == getuid() ? the_user() : NULL; }
++struct passwd *getpwnam(const char *name) { return strcmp(name, user_name()) ? NULL : the_user(); }
++
++static struct group *the_group(void) {
++  static struct group entry;
++  static char *members[1];
++  entry = (struct group){user_name(), "*", getgid(), members};
++  return &entry;
++}
++
++struct group *getgrgid(gid_t gid) { return gid == getgid() ? the_group() : NULL; }
++struct group *getgrnam(const char *name) { return strcmp(name, user_name()) ? NULL : the_group(); }
++int getgroups(int count, gid_t list[]) {
++  if (count == 0)
++    return 1;
++  list[0] = getgid();
++  return 1;
++}
++char *getlogin(void) { return user_name(); }
++char *ttyname(int fd) {
++  if (!isatty(fd)) {
++    errno = ENOTTY;
++    return NULL;
++  }
++  return "/dev/tty";
++}
++
++int tcgetattr(int fd, struct termios *terminal) {
++  if (!isatty(fd)) {
++    errno = ENOTTY;
++    return -1;
++  }
++  memset(terminal, 0, sizeof *terminal);
++  return 0;
++}
++int tcsetattr(int fd, int actions, const struct termios *terminal) {
++  (void)actions;
++  (void)terminal;
++  if (!isatty(fd)) {
++    errno = ENOTTY;
++    return -1;
++  }
++  return 0;
++}
++
++int getrlimit(int resource, struct rlimit *limit) {
++  limit->rlim_cur = limit->rlim_max = resource == RLIMIT_NOFILE ? 1024 : RLIM_INFINITY;
++  return 0;
++}
++int setrlimit(int resource, const struct rlimit *limit) {
++  (void)resource;
++  (void)limit;
++  return 0;
++}
++
++// MARK: - Sockets
++
++/// The text form of an address, or -1 (errno set).
++static int address_text(const struct sockaddr *address, socklen_t size, char text[INET6_ADDRSTRLEN], int *port) {
++  if (address->sa_family == AF_INET && size >= sizeof(struct sockaddr_in)) {
++    const struct sockaddr_in *ipv4 = (const void *)address;
++    inet_ntop(AF_INET, &ipv4->sin_addr, text, INET6_ADDRSTRLEN);
++    *port = ntohs(ipv4->sin_port);
++    return 0;
++  }
++  if (address->sa_family == AF_INET6 && size >= sizeof(struct sockaddr_in6)) {
++    const struct sockaddr_in6 *ipv6 = (const void *)address;
++    inet_ntop(AF_INET6, &ipv6->sin6_addr, text, INET6_ADDRSTRLEN);
++    *port = ntohs(ipv6->sin6_port);
++    return 0;
++  }
++  errno = EAFNOSUPPORT;
++  return -1;
++}
++
++static void store_address(const char *text, int port, struct sockaddr *address, socklen_t *size) {
++  if (!address || !size)
++    return;
++  struct sockaddr_storage storage;
++  memset(&storage, 0, sizeof storage);
++  socklen_t length;
++  if (strchr(text, ':')) {
++    struct sockaddr_in6 *ipv6 = (void *)&storage;
++    ipv6->sin6_family = AF_INET6;
++    ipv6->sin6_port = htons(port);
++    inet_pton(AF_INET6, text, &ipv6->sin6_addr);
++    length = sizeof *ipv6;
++  } else {
++    struct sockaddr_in *ipv4 = (void *)&storage;
++    ipv4->sin_family = AF_INET;
++    ipv4->sin_port = htons(port);
++    inet_pton(AF_INET, text, &ipv4->sin_addr);
++    length = sizeof *ipv4;
++  }
++  memcpy(address, &storage, length < *size ? length : *size);
++  *size = length;
++}
++
++// The descriptors that are sockets. They go straight to the kernel: read and write here, not through file streams.
++#define MAX_SOCKETS 1024
++static unsigned char sockets[MAX_SOCKETS];
++
++void __operator_note_socket(int fd, int is_socket) {
++  if (fd >= 0 && fd < MAX_SOCKETS)
++    sockets[fd] = is_socket;
++}
++
++static int is_socket(int fd) { return fd >= 0 && fd < MAX_SOCKETS && sockets[fd]; }
++
++void __operator_set_nonblocking(int file, int on) { kernel_socket_option(file, 8, on, 1); }
++
++/// recv and send for read and write: the bytes, or -2 if `fd` isn't a socket.
++ssize_t __operator_socket_read(int fd, void *data, size_t size) {
++  if (!is_socket(fd))
++    return -2;
++  return recv(fd, data, size, 0);
++}
++
++ssize_t __operator_socket_write(int fd, const void *data, size_t size) {
++  if (!is_socket(fd))
++    return -2;
++  return send(fd, data, size, 0);
++}
++
++/// poll, if a socket is among the descriptors; -2 if none is. Anything else counts as ready.
++int __operator_poll(struct pollfd *fds, nfds_t count, const struct timespec *timeout) {
++  int found = 0;
++  for (nfds_t i = 0; i < count; i++)
++    found |= is_socket(fds[i].fd);
++  if (!found)
++    return -2;
++  int32_t *entries = malloc(count * 8 + 8);
++  if (!entries) {
++    errno = ENOMEM;
++    return -1;
++  }
++  size_t used = 0;
++  int ready = 0;
++  for (nfds_t i = 0; i < count; i++) {
++    fds[i].revents = 0;
++    if (fds[i].fd < 0)
++      continue;
++    if (is_socket(fds[i].fd)) {
++      entries[used * 2] = file_of(fds[i].fd);
++      entries[used * 2 + 1] = ((fds[i].events & POLLIN) ? 1 : 0) | ((fds[i].events & POLLOUT) ? 2 : 0);
++      used++;
++    } else if (fds[i].events & (POLLIN | POLLOUT)) {
++      fds[i].revents = fds[i].events & (POLLIN | POLLOUT);
++      ready++;
++    }
++  }
++  int wait = ready ? 0 : !timeout ? -1 : timeout->tv_sec * 1000 + timeout->tv_nsec / 1000000;
++  struct string reply = {0, 0};
++  kernel_poll(entries, used * 8, wait, &reply);
++  free(entries);
++  const uint16_t *events = (const void *)reply.pointer;
++  size_t next = 0;
++  for (nfds_t i = 0; i < count; i++) {
++    if (!is_socket(fds[i].fd))
++      continue;
++    int happened = next * 2 < reply.length ? events[next] : 0;
++    next++;
++    fds[i].revents = ((happened & 1) ? POLLIN : 0) | ((happened & 2) ? POLLOUT : 0) | ((happened & 0x1000) ? POLLERR : 0) |
++                     ((happened & 0x2000) ? POLLHUP : 0);
++    fds[i].revents &= fds[i].events | POLLERR | POLLHUP;
++    if (fds[i].revents)
++      ready++;
++  }
++  free(reply.pointer);
++  return ready;
++}
++
++int socket(int domain, int type, int protocol) {
++  int kind = type & ~(SOCK_NONBLOCK | SOCK_CLOEXEC);
++  if (domain != AF_INET && domain != AF_INET6) {
++    errno = EAFNOSUPPORT;
++    return -1;
++  }
++  if (kind != SOCK_STREAM && kind != SOCK_DGRAM) {
++    errno = EPROTONOSUPPORT;
++    return -1;
++  }
++  int32_t handle = kernel_socket(domain == AF_INET ? 4 : 6, kind == SOCK_STREAM ? 1 : 2, protocol);
++  if (handle < 0) {
++    errno = -handle;
++    return -1;
++  }
++  int fd = __wasilibc_add_file((filesystem_own_descriptor_t){handle}, O_RDWR);
++  __operator_note_socket(fd, 1);
++  if (fd >= 0 && (type & SOCK_NONBLOCK))
++    __operator_set_nonblocking(handle, 1);
++  return fd;
++}
++
++int __operator_connect(int file, const struct sockaddr *address, socklen_t size) {
++  char text[INET6_ADDRSTRLEN];
++  int port;
++  if (address_text(address, size, text, &port) < 0)
++    return -1;
++  return check(kernel_connect(file, text, strlen(text), port));
++}
++
++int __operator_bind(int file, const struct sockaddr *address, socklen_t size) {
++  char text[INET6_ADDRSTRLEN];
++  int port;
++  if (address_text(address, size, text, &port) < 0)
++    return -1;
++  return check(kernel_bind(file, text, strlen(text), port));
++}
++
++int __operator_listen(int file, int backlog) { return check(kernel_listen(file, backlog)); }
++
++int __operator_accept(int file, struct sockaddr *address, socklen_t *size) {
++  int32_t handle = kernel_accept(file);
++  if (handle < 0) {
++    errno = -handle;
++    return -1;
++  }
++  __operator_socket_name(handle, 1, address, size);
++  int fd = __wasilibc_add_file((filesystem_own_descriptor_t){handle}, O_RDWR);
++  __operator_note_socket(fd, 1);
++  return fd;
++}
++
++int __operator_socket_name(int file, int peer, struct sockaddr *address, socklen_t *size) {
++  struct string text = {0, 0};
++  kernel_socket_name(file, peer, &text);
++  if (!text.length) {
++    free(text.pointer);
++    errno = peer ? ENOTCONN : EINVAL;
++    return -1;
++  }
++  char copy[80] = {0}, ip[64] = {0};
++  memcpy(copy, text.pointer, text.length < 79 ? text.length : 79);
++  free(text.pointer);
++  int port = 0;
++  sscanf(copy, "%63s %d", ip, &port);
++  store_address(ip, port, address, size);
++  return 0;
++}
++
++int __operator_shutdown(int file, int how) { return check(kernel_shutdown(file, how)); }
++
++ssize_t __operator_send_to(int file, const void *data, size_t size, const struct sockaddr *address, socklen_t address_size) {
++  char text[INET6_ADDRSTRLEN] = "";
++  int port = 0;
++  if (address && address_text(address, address_size, text, &port) < 0)
++    return -1;
++  int32_t sent = kernel_send_to(file, data, size, text, strlen(text), port);
++  if (sent < 0) {
++    errno = -sent;
++    return -1;
++  }
++  return sent;
++}
++
++ssize_t __operator_receive_from(int file, void *data, size_t size, int flags, struct sockaddr *address, socklen_t *address_size) {
++  struct string reply = {0, 0};
++  kernel_receive_from(file, size, (flags & MSG_PEEK) != 0, &reply);
++  const unsigned char *bytes = (const void *)reply.pointer;
++  int32_t error;
++  memcpy(&error, bytes, 4);
++  if (error) {
++    free(reply.pointer);
++    errno = error;
++    return -1;
++  }
++  int port = bytes[4] | bytes[5] << 8;
++  size_t length = bytes[6];
++  char text[64] = {0};
++  memcpy(text, bytes + 7, length < 63 ? length : 63);
++  size_t received = reply.length - 7 - length;
++  memcpy(data, bytes + 7 + length, received);
++  free(reply.pointer);
++  if (text[0])
++    store_address(text, port, address, address_size);
++  return received;
++}
++
++/// The kernel's number for a socket option (1 SO_REUSEADDR, 2 SO_KEEPALIVE, 3 SO_ERROR, 4 SO_BROADCAST, 5 TCP_NODELAY,
++/// 6 SO_RCVBUF, 7 SO_SNDBUF), or 0.
++static int option_number(int level, int name) {
++  if (level == SOL_SOCKET) {
++    switch (name) {
++    case SO_REUSEADDR: return 1;
++    case SO_KEEPALIVE: return 2;
++    case SO_ERROR: return 3;
++#ifdef SO_BROADCAST
++    case SO_BROADCAST: return 4;
++#endif
++#ifdef SO_RCVBUF
++    case SO_RCVBUF: return 6;
++#endif
++#ifdef SO_SNDBUF
++    case SO_SNDBUF: return 7;
++#endif
++    }
++  } else if (level == IPPROTO_TCP && name == 1 /* TCP_NODELAY */) {
++    return 5;
++  }
++  return 0;
++}
++
++int __operator_get_option(int file, int level, int name, void *value, socklen_t *size) {
++  int option = option_number(level, name);
++  if (!option) {
++    errno = ENOPROTOOPT;
++    return -1;
++  }
++  int32_t result = kernel_socket_option(file, option, 0, 0);
++  if (result < 0) {
++    errno = -result;
++    return -1;
++  }
++  memcpy(value, &result, *size < 4 ? *size : 4);
++  *size = 4;
++  return 0;
++}
++
++int __operator_set_option(int file, int level, int name, const void *value, socklen_t size) {
++  int option = option_number(level, name);
++  if (!option) {
++    errno = ENOPROTOOPT;
++    return -1;
++  }
++  int32_t number = 0;
++  memcpy(&number, value, size < 4 ? size : 4);
++  int32_t result = kernel_socket_option(file, option, number, 1);
++  if (result < 0) {
++    errno = -result;
++    return -1;
++  }
++  return 0;
++}
++
++// MARK: - Names
++
++static struct addrinfo *one_result(const char *text, int port, int socket_type, int protocol) {
++  struct addrinfo *result = calloc(1, sizeof *result);
++  struct sockaddr_storage *address = calloc(1, sizeof *address);
++  if (!result || !address) {
++    free(result);
++    free(address);
++    return NULL;
++  }
++  socklen_t size = sizeof *address;
++  store_address(text, port, (void *)address, &size);
++  result->ai_family = address->ss_family;
++  result->ai_socktype = socket_type;
++  result->ai_protocol = protocol;
++  result->ai_addr = (void *)address;
++  result->ai_addrlen = size;
++  return result;
++}
++
++int getaddrinfo(const char *restrict host, const char *restrict service, const struct addrinfo *restrict hints,
++                struct addrinfo **restrict results) {
++  int family = hints ? hints->ai_family : AF_UNSPEC, flags = hints ? hints->ai_flags : 0;
++  int socket_type = hints ? hints->ai_socktype : 0, protocol = hints ? hints->ai_protocol : 0;
++  if (!host && !service)
++    return EAI_NONAME;
++  int port = 0;
++  if (service) {
++    char *end;
++    port = strtol(service, &end, 10);
++    if (*end) {
++      struct servent *entry = (flags & AI_NUMERICSERV) ? NULL : getservbyname(service, NULL);
++      if (!entry)
++        return EAI_SERVICE;
++      port = ntohs(entry->s_port);
++    }
++  }
++  char *addresses;
++  unsigned char ignored[16];
++  if (!host) {
++    addresses = strdup(flags & AI_PASSIVE ? "0.0.0.0 ::" : "127.0.0.1 ::1");
++  } else if (inet_pton(AF_INET, host, ignored) == 1 || inet_pton(AF_INET6, host, ignored) == 1) {
++    addresses = strdup(host);
++  } else if (flags & AI_NUMERICHOST) {
++    return EAI_NONAME;
++  } else {
++    struct string text = {0, 0};
++    kernel_resolve(host, strlen(host), &text);
++    if (!text.length) {
++      free(text.pointer);
++      return EAI_NONAME;
++    }
++    addresses = strndup(text.pointer, text.length);
++    free(text.pointer);
++  }
++  if (!addresses)
++    return EAI_MEMORY;
++  struct addrinfo *first = NULL, **next = &first;
++  static const int kinds[] = {SOCK_STREAM, SOCK_DGRAM};
++  for (char *item = strtok(addresses, " "); item; item = strtok(NULL, " ")) {
++    int found = strchr(item, ':') ? AF_INET6 : AF_INET;
++    if (family != AF_UNSPEC && family != found)
++      continue;
++    for (int i = 0; i < 2; i++) {
++      if (socket_type && socket_type != kinds[i])
++        continue;
++      struct addrinfo *entry = one_result(item, port, kinds[i], protocol ? protocol : kinds[i] == SOCK_STREAM ? IPPROTO_TCP : IPPROTO_UDP);
++      if (!entry) {
++        free(addresses);
++        freeaddrinfo(first);
++        return EAI_MEMORY;
++      }
++      *next = entry;
++      next = &entry->ai_next;
++    }
++  }
++  free(addresses);
++  if (!first)
++    return EAI_NONAME;
++  if (host && (flags & AI_CANONNAME))
++    first->ai_canonname = strdup(host);
++  *results = first;
++  return 0;
++}
++
++struct hostent *gethostbyname(const char *name) {
++  static struct hostent entry;
++  static char *aliases[1], *list[2], address[16];
++  struct addrinfo hints = {.ai_family = AF_INET, .ai_socktype = SOCK_STREAM}, *result;
++  if (getaddrinfo(name, NULL, &hints, &result)) {
++    h_errno = HOST_NOT_FOUND;
++    return NULL;
++  }
++  memcpy(address, &((struct sockaddr_in *)result->ai_addr)->sin_addr, 4);
++  freeaddrinfo(result);
++  list[0] = address;
++  entry = (struct hostent){(char *)name, aliases, AF_INET, 4, list};
++  return &entry;
++}
++
++int getnameinfo(const struct sockaddr *restrict address, socklen_t size, char *restrict host, socklen_t host_size,
++                char *restrict service, socklen_t service_size, int flags) {
++  (void)flags;
++  char text[INET6_ADDRSTRLEN];
++  int port;
++  if (address_text(address, size, text, &port) < 0)
++    return EAI_FAMILY;
++  if (host && host_size)
++    snprintf(host, host_size, "%s", text);
++  if (service && service_size)
++    snprintf(service, service_size, "%d", port);
++  return 0;
++}
+diff --git a/libc-bottom-half/sources/posix.c b/libc-bottom-half/sources/posix.c
+index 47761d7..9874836 100644
+--- a/libc-bottom-half/sources/posix.c
++++ b/libc-bottom-half/sources/posix.c
+@@ -4,6 +4,7 @@
+ #include <dirent.h>
+ #include <errno.h>
+ #include <fcntl.h>
++#include <stdarg.h>
+ #include <stdlib.h>
+ #include <sys/stat.h>
+ #include <sys/statvfs.h>
+@@ -13,6 +14,11 @@
+ #include <wasi/libc-nocwd.h>
+ #include <wasi/libc.h>
+ 
++extern int __operator_chmod(const char *path, mode_t mode);
++extern void __operator_create_mode(mode_t mode);
++extern int __operator_access(const char *path, int mode);
++extern int __operator_file_mode(const char *path, int follow);
++
+ static int find_relpath2(const char *path, char **relative,
+                          size_t *relative_len) {
+   // See comments in `preopens.c` for what this trick is doing.
+@@ -46,8 +52,12 @@ static int find_relpath_alt(const char *path, char **relative) {
+ }
+ 
+ int open(const char *path, int oflag, ...) {
+-  // WASI libc's `openat` ignores the mode argument, so call a special
+-  // entrypoint which avoids the varargs calling convention.
++  if (oflag & O_CREAT) {
++    va_list ap;
++    va_start(ap, oflag);
++    __operator_create_mode(va_arg(ap, mode_t));
++    va_end(ap);
++  }
+   return __wasilibc_open_nomode(path, oflag);
+ }
+ 
+@@ -66,16 +76,7 @@ int __wasilibc_open_nomode(const char *path, int oflag) {
+ }
+ 
+ int access(const char *path, int amode) {
+-  char *relative_path;
+-  int dirfd = find_relpath(path, &relative_path);
+-
+-  // If we can't find a preopen for it, fail as if we can't find the path.
+-  if (dirfd == -1) {
+-    errno = ENOENT;
+-    return -1;
+-  }
+-
+-  return __wasilibc_nocwd_faccessat(dirfd, relative_path, amode, 0);
++  return __operator_access(path, amode);
+ }
+ 
+ ssize_t readlink(const char *restrict path, char *restrict buf,
+@@ -92,6 +93,16 @@ ssize_t readlink(const char *restrict path, char *restrict buf,
+   return __wasilibc_nocwd_readlinkat(dirfd, relative_path, buf, bufsize);
+ }
+ 
++static int finish_stat(const char *path, struct stat *buf, int follow, int result) {
++  // WASI's stat has no permissions; the kernel keeps them.
++  if (result == 0) {
++    int mode = __operator_file_mode(path, follow);
++    if (mode >= 0)
++      buf->st_mode = (buf->st_mode & S_IFMT) | mode;
++  }
++  return result;
++}
++
+ int stat(const char *restrict path, struct stat *restrict buf) {
+   char *relative_path;
+   int dirfd = find_relpath(path, &relative_path);
+@@ -102,7 +113,7 @@ int stat(const char *restrict path, struct stat *restrict buf) {
+     return -1;
+   }
+ 
+-  return __wasilibc_nocwd_fstatat(dirfd, relative_path, buf, 0);
++  return finish_stat(path, buf, 1, __wasilibc_nocwd_fstatat(dirfd, relative_path, buf, 0));
+ }
+ 
+ int lstat(const char *restrict path, struct stat *restrict buf) {
+@@ -115,8 +126,7 @@ int lstat(const char *restrict path, struct stat *restrict buf) {
+     return -1;
+   }
+ 
+-  return __wasilibc_nocwd_fstatat(dirfd, relative_path, buf,
+-                                  AT_SYMLINK_NOFOLLOW);
++  return finish_stat(path, buf, 0, __wasilibc_nocwd_fstatat(dirfd, relative_path, buf, AT_SYMLINK_NOFOLLOW));
+ }
+ 
+ int utime(const char *path, const struct utimbuf *times) {
+@@ -212,6 +222,7 @@ int remove(const char *path) {
+ }
+ 
+ int mkdir(const char *path, mode_t mode) {
++  __operator_create_mode(mode);
+   (void)mode;
+   char *relative_path;
+   int dirfd = find_relpath(path, &relative_path);
+@@ -304,58 +315,9 @@ int rename(const char *old, const char *new) {
+ }
+ 
+ int chmod(const char *path, mode_t mode) {
+-  (void)path;
+-  (void)mode;
+-  // TODO: We plan to support this eventually in WASI, but not yet.
+-  // Meanwhile, we provide a stub so that libc++'s `<filesystem>`
+-  // implementation will build unmodified.
+-  errno = ENOSYS;
+-  return -1;
+-}
+-
+-int fchmod(int fd, mode_t mode) {
+-  (void)fd;
+-  (void)mode;
+-  // TODO: We plan to support this eventually in WASI, but not yet.
+-  // Meanwhile, we provide a stub so that libc++'s `<filesystem>`
+-  // implementation will build unmodified.
+-  errno = ENOSYS;
+-  return -1;
+-}
+-
+-int fchmodat(int fd, const char *path, mode_t mode, int flag) {
+-  (void)fd;
+-  (void)path;
+-  (void)mode;
+-  (void)flag;
+-  // TODO: We plan to support this eventually in WASI, but not yet.
+-  // Meanwhile, we provide a stub so that libc++'s `<filesystem>`
+-  // implementation will build unmodified.
+-  errno = ENOSYS;
+-  return -1;
+-}
+-
+-int statvfs(const char *__restrict path, struct statvfs *__restrict buf) {
+-  (void)path;
+-  (void)buf;
+-  // TODO: We plan to support this eventually in WASI, but not yet.
+-  // Meanwhile, we provide a stub so that libc++'s `<filesystem>`
+-  // implementation will build unmodified.
+-  errno = ENOSYS;
+-  return -1;
+-}
+-
+-int fstatvfs(int fd, struct statvfs *buf) {
+-  (void)fd;
+-  (void)buf;
+-  // TODO: We plan to support this eventually in WASI, but not yet.
+-  // Meanwhile, we provide a stub so that libc++'s `<filesystem>`
+-  // implementation will build unmodified.
+-  errno = ENOSYS;
+-  return -1;
++  return __operator_chmod(path, mode);
+ }
+ 
+-// Like `access`, but with `faccessat`'s flags argument.
+ int __wasilibc_access(const char *path, int mode, int flags) {
+   char *relative_path;
+   int dirfd = find_relpath(path, &relative_path);
+diff --git a/libc-bottom-half/sources/ppoll.c b/libc-bottom-half/sources/ppoll.c
+index 8ccd184..c46c900 100644
+--- a/libc-bottom-half/sources/ppoll.c
++++ b/libc-bottom-half/sources/ppoll.c
+@@ -598,6 +598,14 @@ static int validate_something_not_pollpri(struct pollfd *fds, size_t nfds) {
+ 
+ int ppoll(struct pollfd *fds, nfds_t nfds, const struct timespec *timeout,
+           const sigset_t *sigmask) {
++#if defined(__wasip3__)
++  // Sockets are the kernel's, so it waits for them.
++  extern int __operator_poll(struct pollfd *, nfds_t, const struct timespec *);
++  int kernel = __operator_poll(fds, nfds, timeout);
++  if (kernel != -2)
++    return kernel;
++#endif
++
+   (void)sigmask;
+   if (timeout && (timeout->tv_sec < 0 || timeout->tv_nsec >= 1000000000 ||
+                   timeout->tv_nsec < 0)) {
+diff --git a/libc-top-half/CMakeLists.txt b/libc-top-half/CMakeLists.txt
+index 39c175b..b70727e 100644
+--- a/libc-top-half/CMakeLists.txt
++++ b/libc-top-half/CMakeLists.txt
+@@ -82,11 +82,9 @@ list(REMOVE_ITEM globbed_headers
+   musl/arch/generic/bits/shm.h
+   musl/arch/generic/bits/soundcard.h
+   musl/arch/generic/bits/statfs.h
+-  musl/arch/generic/bits/termios.h
+   musl/arch/generic/bits/vt.h
+   musl/include/aio.h
+   musl/include/elf.h
+-  musl/include/grp.h
+   musl/include/lastlog.h
+   musl/include/libintl.h
+   musl/include/link.h
+@@ -99,14 +97,11 @@ list(REMOVE_ITEM globbed_headers
+   musl/include/netinet/if_ether.h
+   musl/include/paths.h
+   musl/include/pty.h
+-  musl/include/pwd.h
+-  musl/include/pwd.h
+   musl/include/resolv.h
+   musl/include/scsi/scsi.h
+   musl/include/scsi/scsi_ioctl.h
+   musl/include/scsi/sg.h
+   musl/include/shadow.h
+-  musl/include/spawn.h
+   musl/include/sys/acct.h
+   musl/include/sys/auxv.h
+   musl/include/sys/cachectl.h
+@@ -137,21 +132,17 @@ list(REMOVE_ITEM globbed_headers
+   musl/include/sys/swap.h
+   musl/include/sys/syslog.h
+   musl/include/sys/sysmacros.h
+-  musl/include/sys/termios.h
+   musl/include/sys/timerfd.h
+   musl/include/sys/ucontext.h
+   musl/include/sys/user.h
+   musl/include/sys/vfs.h
+   musl/include/sys/vt.h
+-  musl/include/sys/wait.h
+   musl/include/sys/xattr.h
+   musl/include/syslog.h
+-  musl/include/termios.h
+   musl/include/ucontext.h
+   musl/include/ulimit.h
+   musl/include/utmp.h
+   musl/include/utmpx.h
+-  musl/include/wait.h
+   musl/include/wordexp.h
+ )
+ 
+diff --git a/libc-top-half/musl/include/signal.h b/libc-top-half/musl/include/signal.h
+index 75b5e55..e161f2a 100644
+--- a/libc-top-half/musl/include/signal.h
++++ b/libc-top-half/musl/include/signal.h
+@@ -15,7 +15,7 @@ extern "C" {
+  || defined(_XOPEN_SOURCE) || defined(_GNU_SOURCE) \
+  || defined(_BSD_SOURCE)
+ 
+-#ifdef __wasilibc_unmodified_upstream /* WASI has no ucontext support */
++#if 1 /* WASI has no ucontext support */
+ #ifdef _GNU_SOURCE
+ #define __ucontext ucontext
+ #endif
+@@ -57,7 +57,7 @@ typedef struct sigaltstack stack_t;
+  || defined(_XOPEN_SOURCE) || defined(_GNU_SOURCE) \
+  || defined(_BSD_SOURCE)
+ 
+-#ifdef __wasilibc_unmodified_upstream /* WASI has no sigaction */
++#if 1 /* WASI has no sigaction */
+ #define SIG_HOLD ((void (*)(int)) 2)
+ 
+ #define FPE_INTDIV 1
+@@ -220,7 +220,7 @@ int __libc_current_sigrtmax(void);
+ #define SIGRTMAX  (__libc_current_sigrtmax())
+ #endif
+ 
+-#ifdef __wasilibc_unmodified_upstream /* WASI has no signals */
++#if 1 /* WASI has no signals */
+ int kill(pid_t, int);
+ 
+ int sigemptyset(sigset_t *);
+@@ -244,14 +244,14 @@ int pthread_sigmask(int, const sigset_t *__restrict, sigset_t *__restrict);
+ int pthread_kill(pthread_t, int);
+ #endif
+ 
+-#ifdef __wasilibc_unmodified_upstream /* WASI has no siginfo */
++#if 1 /* WASI has no siginfo */
+ void psiginfo(const siginfo_t *, const char *);
+ #endif
+ void psignal(int, const char *);
+ 
+ #endif
+ 
+-#ifdef __wasilibc_unmodified_upstream /* WASI has no signals */
++#if 1 /* WASI has no signals */
+ #if defined(_XOPEN_SOURCE) || defined(_BSD_SOURCE) || defined(_GNU_SOURCE)
+ int killpg(pid_t, int);
+ int sigaltstack(const stack_t *__restrict, stack_t *__restrict);
+@@ -290,7 +290,7 @@ typedef void (*sig_t)(int);
+ #ifdef _GNU_SOURCE
+ typedef void (*sighandler_t)(int);
+ void (*bsd_signal(int, void (*)(int)))(int);
+-#ifdef __wasilibc_unmodified_upstream /* WASI has no signal sets */
++#if 1 /* WASI has no signal sets */
+ int sigisemptyset(const sigset_t *);
+ int sigorset (sigset_t *, const sigset_t *, const sigset_t *);
+ int sigandset(sigset_t *, const sigset_t *, const sigset_t *);
+diff --git a/libc-top-half/musl/include/stdio.h b/libc-top-half/musl/include/stdio.h
+index c59b3a8..2ae1fe9 100644
+--- a/libc-top-half/musl/include/stdio.h
++++ b/libc-top-half/musl/include/stdio.h
+@@ -61,7 +61,7 @@ extern "C" {
+ #define BUFSIZ 1024
+ #define FILENAME_MAX 4096
+ #define FOPEN_MAX 1000
+-#ifdef __wasilibc_unmodified_upstream /* WASI has no temp directories */
++#if 1 /* WASI has no temp directories */
+ #define TMP_MAX 10000
+ #define L_tmpnam 20
+ #endif
+@@ -145,7 +145,7 @@ void perror(const char *);
+ int setvbuf(FILE *__restrict, char *__restrict, int, size_t);
+ void setbuf(FILE *__restrict, char *__restrict);
+ 
+-#ifdef __wasilibc_unmodified_upstream /* WASI has no temp directories */
++#if 1 /* WASI has no temp directories */
+ char *tmpnam(char *);
+ FILE *tmpfile(void);
+ #else
+@@ -159,7 +159,7 @@ FILE *tmpfile(void) __attribute__((__deprecated__("tmpfile is not defined on WAS
+ FILE *fmemopen(void *__restrict, size_t, const char *__restrict);
+ FILE *open_memstream(char **, size_t *);
+ FILE *fdopen(int, const char *);
+-#ifdef __wasilibc_unmodified_upstream /* WASI has no popen */
++#if 1 /* WASI has no popen */
+ FILE *popen(const char *, const char *);
+ int pclose(FILE *);
+ #endif
+@@ -190,7 +190,7 @@ char *ctermid(char *);
+ int renameat2(int, const char *, int, const char *, unsigned);
+ #endif
+ 
+-#ifdef __wasilibc_unmodified_upstream /* WASI has no temp directories */
++#if 1 /* WASI has no temp directories */
+ #if defined(_XOPEN_SOURCE) || defined(_GNU_SOURCE) \
+  || defined(_BSD_SOURCE)
+ #define P_tmpdir "/tmp"
+@@ -239,7 +239,7 @@ FILE *fopencookie(void *, const char *, cookie_io_functions_t);
+ #endif
+ 
+ #if defined(_LARGEFILE64_SOURCE) || defined(_GNU_SOURCE)
+-#ifdef __wasilibc_unmodified_upstream /* WASI has no temp directories */
++#if 1 /* WASI has no temp directories */
+ #define tmpfile64 tmpfile
+ #endif
+ #define fopen64 fopen
+diff --git a/libc-top-half/musl/include/stdlib.h b/libc-top-half/musl/include/stdlib.h
+index c5b6cd2..95070f8 100644
+--- a/libc-top-half/musl/include/stdlib.h
++++ b/libc-top-half/musl/include/stdlib.h
+@@ -115,7 +115,7 @@ size_t __ctype_get_mb_cur_max(void);
+ int posix_memalign (void **, size_t, size_t);
+ int setenv (const char *, const char *, int);
+ int unsetenv (const char *);
+-#ifdef __wasilibc_unmodified_upstream /* WASI has no temp directories */
++#if 1 /* WASI has no temp directories */
+ int mkstemp (char *);
+ int mkostemp (char *, int);
+ char *mkdtemp (char *);
+@@ -156,7 +156,7 @@ void lcong48 (unsigned short [7]);
+ 
+ #if defined(_GNU_SOURCE) || defined(_BSD_SOURCE)
+ #include <alloca.h>
+-#ifdef __wasilibc_unmodified_upstream /* WASI has no temp directories */
++#if 1 /* WASI has no temp directories */
+ char *mktemp (char *);
+ int mkstemps (char *, int);
+ int mkostemps (char *, int, int);
+@@ -189,7 +189,7 @@ double strtod_l(const char *__restrict, char **__restrict, struct __locale_struc
+ long double strtold_l(const char *__restrict, char **__restrict, struct __locale_struct *);
+ #endif
+ 
+-#ifdef __wasilibc_unmodified_upstream /* WASI has no temp directories */
++#if 1 /* WASI has no temp directories */
+ #if defined(_LARGEFILE64_SOURCE)
+ #define mkstemp64 mkstemp
+ #define mkostemp64 mkostemp
+diff --git a/libc-top-half/musl/include/sys/resource.h b/libc-top-half/musl/include/sys/resource.h
+index 6c3a7ff..8db3286 100644
+--- a/libc-top-half/musl/include/sys/resource.h
++++ b/libc-top-half/musl/include/sys/resource.h
+@@ -22,6 +22,26 @@ extern "C" {
+ #include <bits/alltypes.h>
+ #include <bits/resource.h>
+ 
++#ifndef __wasilibc_unmodified_upstream
++#ifndef RLIMIT_CPU
++#define RLIMIT_CPU 0
++#define RLIMIT_FSIZE 1
++#define RLIMIT_DATA 2
++#define RLIMIT_STACK 3
++#define RLIMIT_CORE 4
++#define RLIMIT_NOFILE 7
++#define RLIMIT_AS 9
++#endif
++#define RLIM_INFINITY (~0ULL)
++typedef unsigned long long rlim_t;
++struct rlimit {
++	rlim_t rlim_cur;
++	rlim_t rlim_max;
++};
++int getrlimit (int, struct rlimit *);
++int setrlimit (int, const struct rlimit *);
++#endif
++
+ #ifdef __wasilibc_unmodified_upstream /* Use alternate WASI libc headers */
+ typedef unsigned long long rlim_t;
+ 
+diff --git a/libc-top-half/musl/include/sys/stat.h b/libc-top-half/musl/include/sys/stat.h
+index 8ada6f6..54544be 100644
+--- a/libc-top-half/musl/include/sys/stat.h
++++ b/libc-top-half/musl/include/sys/stat.h
+@@ -88,15 +88,15 @@ int fstatat(int, const char *__restrict, struct stat *__restrict, int);
+ int chmod(const char *, mode_t);
+ int fchmod(int, mode_t);
+ int fchmodat(int, const char *, mode_t, int);
+-#ifdef __wasilibc_unmodified_upstream /* WASI has no umask */
++#if 1 /* WASI has no umask */
+ mode_t umask(mode_t);
+ #endif
+ int mkdir(const char *, mode_t);
+-#ifdef __wasilibc_unmodified_upstream /* WASI has no fifo */
++#if 1 /* WASI has no fifo */
+ int mkfifo(const char *, mode_t);
+ #endif
+ int mkdirat(int, const char *, mode_t);
+-#ifdef __wasilibc_unmodified_upstream /* WASI has no fifo */
++#if 1 /* WASI has no fifo */
+ int mkfifoat(int, const char *, mode_t);
+ #endif
+ 
+@@ -111,7 +111,7 @@ int futimens(int, const struct timespec [2]);
+ int utimensat(int, const char *, const struct timespec [2], int);
+ 
+ #if defined(_GNU_SOURCE) || defined(_BSD_SOURCE)
+-#ifdef __wasilibc_unmodified_upstream /* WASI has no chmod */
++#if 1 /* WASI has no chmod */
+ int lchmod(const char *, mode_t);
+ #endif
+ #define S_IREAD S_IRUSR
+diff --git a/libc-top-half/musl/include/unistd.h b/libc-top-half/musl/include/unistd.h
+index 55d4509..e0eae43 100644
+--- a/libc-top-half/musl/include/unistd.h
++++ b/libc-top-half/musl/include/unistd.h
+@@ -89,7 +89,7 @@ ssize_t write(int, const void *, size_t);
+ ssize_t pread(int, void *, size_t, off_t);
+ ssize_t pwrite(int, const void *, size_t, off_t);
+ 
+-#ifdef __wasilibc_unmodified_upstream /* WASI has no chown */
++#if 1 /* WASI has no chown */
+ int chown(const char *, uid_t, gid_t);
+ int fchown(int, uid_t, gid_t);
+ int lchown(const char *, uid_t, gid_t);
+@@ -118,7 +118,7 @@ int ftruncate(int, off_t);
+ int access(const char *, int);
+ int faccessat(int, const char *, int, int);
+ 
+-#ifdef __wasilibc_unmodified_upstream /* WASI has no fchdir */
++#if 1 /* WASI has no fchdir */
+ int fchdir(int);
+ #endif
+ int chdir(const char *);
+@@ -132,7 +132,7 @@ unsigned sleep(unsigned);
+ int pause(void);
+ #endif
+ 
+-#ifdef __wasilibc_unmodified_upstream /* WASI has no fork/exec */
++#if 1 /* WASI has no fork/exec */
+ pid_t fork(void);
+ pid_t _Fork(void);
+ int execve(const char *, char *const [], char *const []);
+@@ -145,16 +145,7 @@ int fexecve(int, char *const [], char *const []);
+ #endif
+ _Noreturn void _exit(int);
+ 
+-#if defined(__wasilibc_unmodified_upstream) || defined(_WASI_EMULATED_GETPID)
+ pid_t getpid(void);
+-#else
+-__attribute__((__deprecated__(
+-"WASI lacks process identifiers; to enable emulation of the `getpid` function using "
+-"a placeholder value, which doesn't reflect the host PID of the program, "
+-"compile with -D_WASI_EMULATED_GETPID and link with -lwasi-emulated-getpid"
+-)))
+-pid_t getpid(void);
+-#endif
+ #ifdef __wasilibc_unmodified_upstream /* WASI has no getpid etc. */
+ pid_t getppid(void);
+ pid_t getpgrp(void);
+@@ -163,7 +154,7 @@ int setpgid(pid_t, pid_t);
+ pid_t setsid(void);
+ pid_t getsid(pid_t);
+ #endif
+-#ifdef __wasilibc_unmodified_upstream /* WASI has no ttyname */
++#if 1 /* WASI has no ttyname */
+ char *ttyname(int);
+ int ttyname_r(int, char *, size_t);
+ #endif
+@@ -173,6 +164,11 @@ pid_t tcgetpgrp(int);
+ int tcsetpgrp(int, pid_t);
+ #endif
+ 
++pid_t getppid(void);
++uid_t getuid(void);
++uid_t geteuid(void);
++gid_t getgid(void);
++gid_t getegid(void);
+ #ifdef __wasilibc_unmodified_upstream /* WASI has no getuid etc. */
+ uid_t getuid(void);
+ uid_t geteuid(void);
+@@ -208,7 +204,7 @@ size_t confstr(int, char *, size_t);
+ int setreuid(uid_t, uid_t);
+ int setregid(gid_t, gid_t);
+ #endif
+-#ifdef __wasilibc_unmodified_upstream /* WASI has no POSIX file locking */
++#if 1 /* WASI has no POSIX file locking */
+ int lockf(int, int, off_t);
+ #endif
+ long gethostid(void);
+@@ -292,7 +288,7 @@ pid_t gettid(void);
+ #define truncate64 truncate
+ #endif
+ #define ftruncate64 ftruncate
+-#ifdef __wasilibc_unmodified_upstream /* WASI has no POSIX file locking */
++#if 1 /* WASI has no POSIX file locking */
+ #define lockf64 lockf
+ #endif
+ #define off64_t off_t
+diff --git a/libc-top-half/musl/src/conf/sysconf.c b/libc-top-half/musl/src/conf/sysconf.c
+index 41f8b35..1f2294b 100644
+--- a/libc-top-half/musl/src/conf/sysconf.c
++++ b/libc-top-half/musl/src/conf/sysconf.c
+@@ -51,7 +51,7 @@ long sysconf(int name)
+ 		[_SC_OPEN_MAX] = RLIM(NOFILE),
+ #else
+ 		// Rlimit is not supported on wasi.
+-		[_SC_OPEN_MAX] = -1,
++		[_SC_OPEN_MAX] = 1024,
+ #endif
+ 
+ 		[_SC_STREAM_MAX] = -1,
+@@ -265,8 +265,7 @@ long sysconf(int name)
+ 			for (; set[i]; set[i]&=set[i]-1, cnt++);
+ 		return cnt;
+ #else
+-		// WASI has no way to query the processor count
+-		return 1;
++		{ extern int __operator_processors(void); return __operator_processors(); }
+ #endif
+ #ifdef __wasilibc_unmodified_upstream // WASI has no sysinfo
+ 	case JT_PHYS_PAGES & 255:

@@ -1,0 +1,63 @@
+package operator:system@0.1.0;
+
+/// The app's kernel: what a program asks of the system beyond WASI. Paths go as the program wrote them.
+/// Errors are libc's errno values, 0 for none.
+interface process {
+  /// The process's working directory, which the kernel keeps.
+  chdir: func(path: string) -> s32;
+  getcwd: func() -> string;
+
+  getpid: func() -> s32;
+  getppid: func() -> s32;
+  getuid: func() -> u32;
+  getgid: func() -> u32;
+
+  /// access(2).
+  access: func(path: string, mode: s32) -> s32;
+  /// The permission bits of `path`, or minus the error.
+  file-mode: func(path: string, follow: s32) -> s32;
+  chmod: func(path: string, mode: s32) -> s32;
+  fchmod: func(file: u32, mode: s32) -> s32;
+  chown: func(path: string, uid: s32, gid: s32, follow: s32) -> s32;
+  mkfifo: func(path: string, mode: s32) -> s32;
+  fchdir: func(file: u32) -> s32;
+  /// The mode for the next file or folder created.
+  create-mode: func(mode: s32);
+  /// flock(2).
+  flock: func(file: u32, operation: s32) -> s32;
+  /// fcntl(2)'s locks: `command` 0 test, 1 set, 2 wait; `kind` 0 read, 1 write, 2 unlock. A test answers kind + 1, or 0
+  /// if nothing is in the way.
+  lock: func(file: u32, command: s32, kind: s32, start: s64, length: s64) -> s32;
+  /// "block-size blocks free", or empty with `statfs-error`.
+  statfs: func(path: string) -> string;
+  processors: func() -> s32;
+
+  /// Runs a command to its end, as the shell would. `program`, if any, is a path in the program's terms put in front of
+  /// `command`. `input` and `output` are files to use for standard input and output, if any. The result is a wait status.
+  run: func(command: string, input: string, output: string, program: string) -> s32;
+
+  /// A socket as a file, or minus the error.
+  socket: func(domain: s32, kind: s32, protocol: s32) -> s32;
+  connect: func(file: u32, address: string, port: s32) -> s32;
+  bind: func(file: u32, address: string, port: s32) -> s32;
+  listen: func(file: u32, backlog: s32) -> s32;
+  /// The new connection as a file, or minus the error.
+  accept: func(file: u32) -> s32;
+  /// "address port", or empty.
+  socket-name: func(file: u32, peer: s32) -> string;
+  shutdown: func(file: u32, how: s32) -> s32;
+  /// The bytes sent, or minus the error.
+  send-to: func(file: u32, data: list<u8>, address: string, port: s32) -> s32;
+  /// A 4-byte error, a 2-byte port, a 1-byte address length, the address, then the data.
+  receive-from: func(file: u32, length: u32, peek: s32) -> list<u8>;
+  socket-option: func(file: u32, name: s32, value: s32, set: s32) -> s32;
+  /// `entries` are pairs of a file and the events wanted (1 read, 2 write), each 4 bytes. The result is the events that
+  /// happened for each, 2 bytes each (0x1000 error, 0x2000 hung up, too).
+  poll: func(entries: list<u8>, timeout: s32) -> list<u8>;
+  /// The addresses of a host, separated by spaces.
+  resolve: func(host: string) -> string;
+}
+
+world system {
+  import process;
+}

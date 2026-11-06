@@ -28,14 +28,15 @@ the simulator, and writes the assets and `SHA256SUMS` to `dist/`.
   command, output goes to the command's own streams, clang runs the linker in-process instead of starting a process,
   and LLVM installs no process-wide signal handlers and does not shut down its global state, so it can run again.
 - `llvm/entry.cpp` is what the app calls. It makes clang build WASI 0.3 components (`wasm32-wasip3`), points it at the sysroot in the user's folder, enables WASI's
-  emulated signal/mman/process-clocks/getpid, setjmp/longjmp, and C++ exceptions (standard WebAssembly exception
+  emulated signal/mman/process-clocks, setjmp/longjmp, and C++ exceptions (standard WebAssembly exception
   instructions, as wasi-sdk's libraries use). Code is position-independent with visible symbols by default, so any
-  object can go into a shared library (`-shared`). A program linked against a shared library of its own (a `.so`
-  input, `-l` found only as `.so`, `-ldl` or `-rdynamic`) is left as a position-independent core module with
-  `dylink.0` instead of a component; the app links it with its libraries when it starts.
-  It also makes main's return value the exit code: WASI 0.3's `run` reports only success or failure, so programs are
-  linked with `--wrap=__main_void` and a small wrapper (built by clang into the user's data folder the first time)
-  that passes a non-zero result to `exit()`.
+  object can go into a shared library (`-shared`). A program uses libc as a shared library unless it says `-static` (or uses C++ exceptions, which the
+  sysroot's shared libc++ lacks): it is left as a position-independent core module with `dylink.0` instead of a
+  component, and the app links it with its libraries when it starts.
+- `llvm/libc/` is wasi-libc as this project builds it, in place of wasi-sdk's: the working directory, paths as written,
+  exit codes, process identity, permissions, locks, commands (`system`, `popen`, `exec`), sockets and names are the app's
+  kernel's (`system.wit`), through an `operator:system` import.
+  `operator.patch` is against the commit wasi-sdk-34 uses.
 - `component/src/lib.rs` also exports `operator_component_link`, wit-component's shared-everything `Linker` (with its
   built-in libdl, since the sysroot's `libdl.so` is a stub), which the app calls to do that.
 - `component/patch.py` lets wasm-component-ld run in-process: it gets its arguments from the caller, runs the

@@ -1,0 +1,9 @@
+[package]
+name = "gen"
+version = "0.0.0"
+edition = "2021"
+[dependencies]
+wit-component = "=0.261.0"
+wit-parser = "=0.261.0"
+anyhow = "=1.0.103"
+[workspace]
